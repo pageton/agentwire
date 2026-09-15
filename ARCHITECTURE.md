@@ -37,18 +37,22 @@ agents     (agent_id, name, type, status, project_id, current_task,
             files JSON, last_msg_id, last_seen, created_at)
 tasks      (task_id, project_id, title, description, status,
             assigned_to, created_by, progress, current_activity,
-            created_at, updated_at)
+            completion_summary, handoff JSON, created_at, updated_at)
 messages   (id, project_id, type, from_agent, to_agent, content,
             reply_to, thread_id, created_at)
-decisions  (id, project_id, title, decision, reason, agent_id, created_at)
+decisions  (id, project_id, title, decision, reason, agent_id,
+            supersedes, created_at)
 context    (project_id, key, value, created_at, updated_at)
 events     (id, type, project_id, data JSON, created_at)
+task_notes (id, task_id, project_id, agent_id, note, created_at)
 ```
 
 Timestamps are RFC3339 UTC strings, generated in Go.
 
 Also owns decisions, key/value context, and the event log — everything that
-does not belong to a domain package.
+does not belong to a domain package. Column additions that `CREATE TABLE IF
+NOT EXISTS` cannot express (e.g. `decisions.supersedes`) are applied by a
+small idempotent migration in `Open` (checked via `PRAGMA table_info`).
 
 ### `internal/agent`
 
@@ -75,6 +79,18 @@ pending → working → completed
 - `UpdateProgress(progress, activity, status?)` clamps 0–100, updates the
   human-readable activity, optionally flips status (e.g. `blocked`).
 - `Complete` sets 100% + `completed`.
+- `CompleteWithHandoff` sets 100% + `completed` plus the completion summary
+  and a structured `Handoff` (summary, changed files, implementation
+  details, decisions made, next steps, relevant context keys) stored as JSON
+  on the task row. Purely informational: a handoff never gates, unlocks or
+  triggers other tasks. Completion publishes `task.completed`; a handoff
+  additionally publishes `task.handoff` carrying the full handoff. Handoffs
+  surface in `get_task`, briefings ("Recently completed") and replay.
+- `AddNote / Notes` — append-only notes attached to a task (the `task_notes`
+  table). Durable knowledge that survives message history scrolling away:
+  interface facts, blockers, handoff context. Notes require an existing task
+  and are published as `task.note_added`; briefings include the notes on the
+  agent's current task.
 
 ### `internal/message`
 
@@ -100,7 +116,8 @@ can replay from SQLite. Events:
 ```
 agent.connected / agent.disconnected / agent.status_changed
 agent.files_changed
-task.created / task.claimed / task.progress / task.blocked / task.completed
+TaskCreated   / task.claimed / task.progress / task.blocked / task.completed
+task.handoff / task.note_added
 message.created / question.created / answer.created
 instruction.created / interface_change.sent
 decision.created
@@ -141,11 +158,32 @@ Per connection:
 
 ### `internal/mcp`
 
-20 tools on top of the stores + hub (see README). Transport: **streamable
+24 tools on top of the stores + hub (see README). Transport: **streamable
 HTTP** at `/mcp` (modern clients) and **legacy SSE** at `/sse` for older
 ones. Identity is an explicit `agent_id` argument (works with stdio-style
 clients too); clients that send HTTP headers may use `X-Agent-Id` as a
 fallback. Tool results are compact text, formatted for LLM consumption.
+
+Knowledge helpers on top of the primitives:
+
+- **Task handoffs.** `complete_task` optionally records a structured
+  handoff (summary, changed files, details, decisions made, next steps,
+  context keys) together with the completion. `get_task` renders the full
+  picture — handoff, completion summary, notes, and the resolved values of
+  the handoff's context keys. Briefings list recently completed tasks with
+  their summaries. Informational only, parallel work unaffected.
+- **Decision supersession.** `record_decision` accepts `supersedes`; the
+  target must exist and belong to the same project. `ListDecisions` computes
+  `SupersededBy` pointing at the *head* of the replacement chain, so
+  briefings and `get_decisions(active_only=true)` show only the decision
+  currently in force.
+- **Context discovery.** `list_context` filters by key prefix and/or a
+  substring of key or value (LIKE wildcards escaped — user input matches
+  literally). Knowledge you cannot find does not exist.
+- **Delta briefings.** Every briefing ends with the latest event id; passing
+  it back as `get_briefing(since_event_id=…)` returns only the events since
+  then (plus the agent's current task state and unread count) — the event
+  id is a per-project cursor over all state changes.
 
 ### `cmd/agentwire`
 

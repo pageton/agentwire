@@ -23,6 +23,8 @@ const (
 	TaskProgress  = "task.progress"
 	TaskBlocked   = "task.blocked"
 	TaskCompleted = "task.completed"
+	TaskHandoff   = "task.handoff"
+	TaskNoteAdded = "task.note_added"
 
 	MessageCreated      = "message.created"
 	QuestionCreated     = "question.created"
@@ -122,6 +124,20 @@ func (h *Hub) Recent(projectID string, limit int) ([]Event, error) {
 	if err != nil {
 		return nil, err
 	}
+	return decodeEventRows(rows), nil
+}
+
+// Since returns events with id > sinceID for a project, oldest first —
+// the delta-briefing query ("what changed while I was away").
+func (h *Hub) Since(projectID string, sinceID int64, limit int) ([]Event, error) {
+	rows, err := h.DB.EventsSince(projectID, sinceID, limit)
+	if err != nil {
+		return nil, err
+	}
+	return decodeEventRows(rows), nil
+}
+
+func decodeEventRows(rows []db.EventRow) []Event {
 	out := make([]Event, 0, len(rows))
 	for _, r := range rows {
 		var data map[string]any
@@ -134,5 +150,5 @@ func (h *Hub) Recent(projectID string, limit int) ([]Event, error) {
 			CreatedAt: r.CreatedAt,
 		})
 	}
-	return out, nil
+	return out
 }

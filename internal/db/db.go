@@ -41,17 +41,19 @@ var statements = []string{
 	);`,
 
 	`CREATE TABLE IF NOT EXISTS tasks (
-		task_id          TEXT PRIMARY KEY,
-		project_id       TEXT NOT NULL,
-		title            TEXT NOT NULL,
-		description      TEXT NOT NULL DEFAULT '',
-		status           TEXT NOT NULL DEFAULT 'pending',
-		assigned_to      TEXT NOT NULL DEFAULT '',
-		created_by       TEXT NOT NULL DEFAULT '',
-		progress         INTEGER NOT NULL DEFAULT 0,
-		current_activity TEXT NOT NULL DEFAULT '',
-		created_at       TEXT NOT NULL,
-		updated_at       TEXT NOT NULL
+		task_id            TEXT PRIMARY KEY,
+		project_id         TEXT NOT NULL,
+		title              TEXT NOT NULL,
+		description        TEXT NOT NULL DEFAULT '',
+		status             TEXT NOT NULL DEFAULT 'pending',
+		assigned_to        TEXT NOT NULL DEFAULT '',
+		created_by         TEXT NOT NULL DEFAULT '',
+		progress           INTEGER NOT NULL DEFAULT 0,
+		current_activity   TEXT NOT NULL DEFAULT '',
+		completion_summary TEXT NOT NULL DEFAULT '',
+		handoff            TEXT NOT NULL DEFAULT '',
+		created_at         TEXT NOT NULL,
+		updated_at         TEXT NOT NULL
 	);`,
 
 	`CREATE TABLE IF NOT EXISTS messages (
@@ -73,6 +75,16 @@ var statements = []string{
 		decision   TEXT NOT NULL,
 		reason     TEXT NOT NULL DEFAULT '',
 		agent_id   TEXT NOT NULL DEFAULT '',
+		supersedes INTEGER NOT NULL DEFAULT 0,
+		created_at TEXT NOT NULL
+	);`,
+
+	`CREATE TABLE IF NOT EXISTS task_notes (
+		id         INTEGER PRIMARY KEY AUTOINCREMENT,
+		task_id    TEXT NOT NULL,
+		project_id TEXT NOT NULL DEFAULT '',
+		agent_id   TEXT NOT NULL DEFAULT '',
+		note       TEXT NOT NULL,
 		created_at TEXT NOT NULL
 	);`,
 
@@ -98,6 +110,7 @@ var statements = []string{
 	`CREATE INDEX IF NOT EXISTS idx_messages_project ON messages(project_id, id);`,
 	`CREATE INDEX IF NOT EXISTS idx_decisions_project ON decisions(project_id);`,
 	`CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id, id);`,
+	`CREATE INDEX IF NOT EXISTS idx_task_notes_task ON task_notes(task_id);`,
 }
 
 // Open opens (or creates) the SQLite database at path, enables WAL mode and
@@ -118,7 +131,57 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("migrate %q: %w", firstLine(stmt), err)
 		}
 	}
+	if err := migrate(sqlDB); err != nil {
+		sqlDB.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
 	return &Store{DB: sqlDB}, nil
+}
+
+// migrations lists column additions that CREATE TABLE IF NOT EXISTS cannot
+// express on databases created by older versions.
+var migrations = []struct {
+	table  string
+	column string
+	decl   string
+}{
+	{"decisions", "supersedes", "INTEGER NOT NULL DEFAULT 0"},
+	{"tasks", "completion_summary", "TEXT NOT NULL DEFAULT ''"},
+	{"tasks", "handoff", "TEXT NOT NULL DEFAULT ''"},
+}
+
+// migrate applies the missing columns from migrations. Idempotent.
+func migrate(sqlDB *sql.DB) error {
+	for _, m := range migrations {
+		present := false
+		rows, err := sqlDB.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, m.table))
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var cid, notNull, pk int
+			var name, typ string
+			var dflt any
+			if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+				rows.Close()
+				return err
+			}
+			if name == m.column {
+				present = true
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+		if !present {
+			if _, err := sqlDB.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, m.table, m.column, m.decl)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Store) Close() error { return s.DB.Close() }
@@ -165,22 +228,39 @@ func (s *Store) ListProjects() ([]string, error) {
 // ---- decisions ----
 
 // Decision is a shared implementation decision recorded by an agent.
+// Supersedes references the decision id this one replaces; SupersededBy is
+// computed on read and marks the decision as replaced by a newer one.
 type Decision struct {
-	ID        int64  `json:"id"`
-	ProjectID string `json:"project_id"`
-	Title     string `json:"title"`
-	Decision  string `json:"decision"`
-	Reason    string `json:"reason,omitempty"`
-	AgentID   string `json:"agent_id,omitempty"`
-	CreatedAt string `json:"created_at"`
+	ID           int64  `json:"id"`
+	ProjectID    string `json:"project_id"`
+	Title        string `json:"title"`
+	Decision     string `json:"decision"`
+	Reason       string `json:"reason,omitempty"`
+	AgentID      string `json:"agent_id,omitempty"`
+	Supersedes   int64  `json:"supersedes,omitempty"`
+	SupersededBy int64  `json:"superseded_by,omitempty"`
+	CreatedAt    string `json:"created_at"`
 }
 
 func (s *Store) RecordDecision(d Decision) (Decision, error) {
+	if d.Supersedes != 0 {
+		var projectID string
+		err := s.DB.QueryRow(`SELECT project_id FROM decisions WHERE id = ?`, d.Supersedes).Scan(&projectID)
+		if err == sql.ErrNoRows {
+			return d, fmt.Errorf("decision #%d to supersede not found", d.Supersedes)
+		}
+		if err != nil {
+			return d, err
+		}
+		if projectID != d.ProjectID {
+			return d, fmt.Errorf("decision #%d belongs to project %q, not %q", d.Supersedes, projectID, d.ProjectID)
+		}
+	}
 	d.CreatedAt = Now()
 	res, err := s.DB.Exec(
-		`INSERT INTO decisions (project_id, title, decision, reason, agent_id, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		d.ProjectID, d.Title, d.Decision, d.Reason, d.AgentID, d.CreatedAt,
+		`INSERT INTO decisions (project_id, title, decision, reason, agent_id, supersedes, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		d.ProjectID, d.Title, d.Decision, d.Reason, d.AgentID, d.Supersedes, d.CreatedAt,
 	)
 	if err != nil {
 		return d, err
@@ -194,7 +274,7 @@ func (s *Store) ListDecisions(projectID string, limit int) ([]Decision, error) {
 		limit = 50
 	}
 	rows, err := s.DB.Query(
-		`SELECT id, project_id, title, decision, reason, agent_id, created_at
+		`SELECT id, project_id, title, decision, reason, agent_id, supersedes, created_at
 		 FROM decisions WHERE project_id = ? ORDER BY id DESC LIMIT ?`,
 		projectID, limit,
 	)
@@ -203,14 +283,34 @@ func (s *Store) ListDecisions(projectID string, limit int) ([]Decision, error) {
 	}
 	defer rows.Close()
 	out := []Decision{}
+	// Newest first. SupersededBy points at the head of the replacement chain
+	// (the current decision), not just the direct replacer — readers following
+	// the pointer land on the decision that is actually in force.
+	supersededBy := map[int64]int64{}
 	for rows.Next() {
 		var d Decision
-		if err := rows.Scan(&d.ID, &d.ProjectID, &d.Title, &d.Decision, &d.Reason, &d.AgentID, &d.CreatedAt); err != nil {
+		if err := rows.Scan(&d.ID, &d.ProjectID, &d.Title, &d.Decision, &d.Reason, &d.AgentID, &d.Supersedes, &d.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, d)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		if out[i].Supersedes == 0 {
+			continue
+		}
+		head := out[i].ID
+		if h, ok := supersededBy[out[i].ID]; ok {
+			head = h
+		}
+		supersededBy[out[i].Supersedes] = head
+	}
+	for i := range out {
+		out[i].SupersededBy = supersededBy[out[i].ID]
+	}
+	return out, nil
 }
 
 // ---- key/value context ----
@@ -246,6 +346,47 @@ func (s *Store) GetContext(projectID, key string) ([]ContextEntry, error) {
 		args = append(args, key)
 	}
 	query += ` ORDER BY key`
+	rows, err := s.DB.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []ContextEntry{}
+	for rows.Next() {
+		var e ContextEntry
+		if err := rows.Scan(&e.ProjectID, &e.Key, &e.Value, &e.CreatedAt, &e.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// likeEscape escapes SQL LIKE wildcards so user-supplied prefixes and search
+// terms are matched literally. Use together with ESCAPE '\'.
+func likeEscape(s string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
+}
+
+// SearchContext returns entries matching a key prefix and/or a substring of
+// key or value. Both filters are optional and combine with AND.
+func (s *Store) SearchContext(projectID, prefix, search string, limit int) ([]ContextEntry, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	query := `SELECT project_id, key, value, created_at, updated_at FROM context WHERE project_id = ?`
+	args := []any{projectID}
+	if prefix != "" {
+		query += ` AND key LIKE ? ESCAPE '\'`
+		args = append(args, likeEscape(prefix)+"%")
+	}
+	if search != "" {
+		query += ` AND (key LIKE ? ESCAPE '\' OR value LIKE ? ESCAPE '\')`
+		pat := "%" + likeEscape(search) + "%"
+		args = append(args, pat, pat)
+	}
+	query += ` ORDER BY key LIMIT ?`
+	args = append(args, limit)
 	rows, err := s.DB.Query(query, args...)
 	if err != nil {
 		return nil, err
@@ -317,6 +458,52 @@ func (s *Store) RecentEvents(projectID string, limit int) ([]EventRow, error) {
 		out[i], out[j] = out[j], out[i]
 	}
 	return out, rows.Err()
+}
+
+// EventsSince returns events with id > sinceID for a project (or all
+// projects when projectID is empty), oldest first — the delta-briefing query.
+func (s *Store) EventsSince(projectID string, sinceID int64, limit int) ([]EventRow, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	query := `SELECT id, type, project_id, data, created_at FROM events WHERE id > ?`
+	args := []any{sinceID}
+	if projectID != "" {
+		query += ` AND (project_id = ? OR project_id = '')`
+		args = append(args, projectID)
+	}
+	query += ` ORDER BY id ASC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.DB.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []EventRow{}
+	for rows.Next() {
+		var r EventRow
+		if err := rows.Scan(&r.ID, &r.Type, &r.ProjectID, &r.Data, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// LatestEventID returns the highest event id for a project (0 when none).
+// Agents store it and pass it back as since_event_id for a delta briefing.
+func (s *Store) LatestEventID(projectID string) (int64, error) {
+	var id sql.NullInt64
+	query := `SELECT MAX(id) FROM events`
+	args := []any{}
+	if projectID != "" {
+		query += ` WHERE project_id = ? OR project_id = ''`
+		args = append(args, projectID)
+	}
+	if err := s.DB.QueryRow(query, args...).Scan(&id); err != nil {
+		return 0, err
+	}
+	return id.Int64, nil
 }
 
 // Counts returns (agents, online agents, tasks, messages, decisions, events).

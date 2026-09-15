@@ -5,6 +5,7 @@ package task
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -21,17 +22,33 @@ const (
 
 // Task represents a piece of work performed by an agent.
 type Task struct {
-	TaskID          string `json:"task_id"`
-	ProjectID       string `json:"project_id"`
-	Title           string `json:"title"`
-	Description     string `json:"description,omitempty"`
-	Status          string `json:"status"`
-	AssignedTo      string `json:"assigned_to,omitempty"`
-	CreatedBy       string `json:"created_by,omitempty"`
-	Progress        int    `json:"progress"`
-	CurrentActivity string `json:"current_activity,omitempty"`
-	CreatedAt       string `json:"created_at"`
-	UpdatedAt       string `json:"updated_at"`
+	TaskID            string   `json:"task_id"`
+	ProjectID         string   `json:"project_id"`
+	Title             string   `json:"title"`
+	Description       string   `json:"description,omitempty"`
+	Status            string   `json:"status"`
+	AssignedTo        string   `json:"assigned_to,omitempty"`
+	CreatedBy         string   `json:"created_by,omitempty"`
+	Progress          int      `json:"progress"`
+	CurrentActivity   string   `json:"current_activity,omitempty"`
+	CompletionSummary string   `json:"completion_summary,omitempty"`
+	Handoff           *Handoff `json:"handoff,omitempty"`
+	CreatedAt         string   `json:"created_at"`
+	UpdatedAt         string   `json:"updated_at"`
+}
+
+// Handoff is the structured completion summary left by the agent that
+// finished a task. It is purely informational: it never blocks, unlocks or
+// triggers other tasks. ContextKeys reference shared project context entries
+// (set_context); DecisionsMade is free text — durable decisions should also
+// be recorded via record_decision.
+type Handoff struct {
+	Summary       string   `json:"summary"`
+	ChangedFiles  []string `json:"changed_files,omitempty"`
+	Details       []string `json:"details,omitempty"`
+	DecisionsMade []string `json:"decisions_made,omitempty"`
+	NextSteps     []string `json:"next_steps,omitempty"`
+	ContextKeys   []string `json:"context_keys,omitempty"`
 }
 
 // Store provides task persistence.
@@ -63,7 +80,7 @@ func (s *Store) Create(t Task) error {
 // Get returns the task or nil when unknown.
 func (s *Store) Get(taskID string) (*Task, error) {
 	row := s.DB.DB.QueryRow(
-		`SELECT task_id, project_id, title, description, status, assigned_to, created_by, progress, current_activity, created_at, updated_at
+		`SELECT task_id, project_id, title, description, status, assigned_to, created_by, progress, current_activity, completion_summary, handoff, created_at, updated_at
 		 FROM tasks WHERE task_id = ?`,
 		taskID,
 	)
@@ -76,7 +93,7 @@ func (s *Store) Get(taskID string) (*Task, error) {
 
 // List returns tasks filtered by project, status and/or assignee.
 func (s *Store) List(projectID, status, assignedTo string) ([]Task, error) {
-	query := `SELECT task_id, project_id, title, description, status, assigned_to, created_by, progress, current_activity, created_at, updated_at
+	query := `SELECT task_id, project_id, title, description, status, assigned_to, created_by, progress, current_activity, completion_summary, handoff, created_at, updated_at
 	          FROM tasks WHERE 1=1`
 	var args []any
 	if projectID != "" {
@@ -171,15 +188,47 @@ func (s *Store) Complete(taskID string) (*Task, error) {
 	return s.Get(taskID)
 }
 
+// CompleteWithHandoff marks the task completed and records the completion
+// summary plus the structured handoff in one update. Informational only —
+// no other task is gated, unlocked or triggered by it.
+func (s *Store) CompleteWithHandoff(taskID, summary string, h *Handoff) (*Task, error) {
+	handoffJSON := ""
+	if h != nil {
+		b, err := json.Marshal(h)
+		if err != nil {
+			return nil, err
+		}
+		handoffJSON = string(b)
+	}
+	res, err := s.DB.DB.Exec(
+		`UPDATE tasks SET status = ?, progress = 100, completion_summary = ?, handoff = ?, updated_at = ? WHERE task_id = ?`,
+		StatusCompleted, summary, handoffJSON, db.Now(), taskID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return nil, fmt.Errorf("task %q not found", taskID)
+	}
+	return s.Get(taskID)
+}
+
 type rowScanner interface {
 	Scan(dest ...any) error
 }
 
 func scanTask(row rowScanner) (*Task, error) {
 	var t Task
-	err := row.Scan(&t.TaskID, &t.ProjectID, &t.Title, &t.Description, &t.Status, &t.AssignedTo, &t.CreatedBy, &t.Progress, &t.CurrentActivity, &t.CreatedAt, &t.UpdatedAt)
+	var handoff string
+	err := row.Scan(&t.TaskID, &t.ProjectID, &t.Title, &t.Description, &t.Status, &t.AssignedTo, &t.CreatedBy, &t.Progress, &t.CurrentActivity, &t.CompletionSummary, &handoff, &t.CreatedAt, &t.UpdatedAt)
 	if err != nil {
 		return nil, err
+	}
+	if handoff != "" {
+		var h Handoff
+		if err := json.Unmarshal([]byte(handoff), &h); err == nil {
+			t.Handoff = &h
+		}
 	}
 	return &t, nil
 }
@@ -207,6 +256,70 @@ func (s *Store) CountsByStatus(projectID string) (map[string]int, error) {
 			return nil, err
 		}
 		out[st] = n
+	}
+	return out, rows.Err()
+}
+
+// ---- task notes ----
+
+// Note is one append-only knowledge entry attached to a task: interface
+// facts, blockers, handoff context. Notes survive message history scrolling
+// away — the next claimant reads the task, not 40 messages.
+type Note struct {
+	ID        int64  `json:"id"`
+	TaskID    string `json:"task_id"`
+	ProjectID string `json:"project_id,omitempty"`
+	AgentID   string `json:"agent_id,omitempty"`
+	Note      string `json:"note"`
+	CreatedAt string `json:"created_at"`
+}
+
+// AddNote appends a note to a task. The task must exist.
+func (s *Store) AddNote(taskID, projectID, agentID, note string) (*Note, error) {
+	t, err := s.Get(taskID)
+	if err != nil {
+		return nil, err
+	}
+	if t == nil {
+		return nil, fmt.Errorf("task %q not found", taskID)
+	}
+	if projectID == "" {
+		projectID = t.ProjectID
+	}
+	n := &Note{TaskID: taskID, ProjectID: projectID, AgentID: agentID, Note: note, CreatedAt: db.Now()}
+	res, err := s.DB.DB.Exec(
+		`INSERT INTO task_notes (task_id, project_id, agent_id, note, created_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		n.TaskID, n.ProjectID, n.AgentID, n.Note, n.CreatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	n.ID, _ = res.LastInsertId()
+	return n, nil
+}
+
+// Notes returns a task's notes, oldest first.
+func (s *Store) Notes(taskID string, limit int) ([]Note, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	rows, err := s.DB.DB.Query(
+		`SELECT id, task_id, project_id, agent_id, note, created_at
+		 FROM task_notes WHERE task_id = ? ORDER BY id ASC LIMIT ?`,
+		taskID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Note{}
+	for rows.Next() {
+		var n Note
+		if err := rows.Scan(&n.ID, &n.TaskID, &n.ProjectID, &n.AgentID, &n.Note, &n.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, n)
 	}
 	return out, rows.Err()
 }

@@ -6,6 +6,7 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -108,10 +109,48 @@ func New(deps Deps) *server.MCPServer {
 
 	s.AddTool(mcp.NewTool("complete_task",
 		mcp.WithDescription("Mark your task completed (progress becomes 100). All agents in the project "+
-			"are notified."),
+			"are notified. Optionally leave a structured handoff so the next agent immediately knows what "+
+			"was done and what to do next: summary (stored as the task's completion summary), changed_files, "+
+			"details (important implementation details), decisions_made, next_steps, and context_keys "+
+			"(keys previously stored with set_context). Handoffs are informational — they never block or "+
+			"trigger other tasks."),
 		mcp.WithString("task_id", mcp.Description("Task id to complete"), mcp.Required()),
 		mcp.WithString("agent_id", mcp.Description("Your agent id"), mcp.Required()),
+		mcp.WithString("summary", mcp.Description("What was accomplished (required when passing handoff fields)")),
+		mcp.WithArray("changed_files", mcp.Description("Files you changed"),
+			mcp.WithStringItems(mcp.Description("A file path"))),
+		mcp.WithArray("details", mcp.Description("Important implementation details"),
+			mcp.WithStringItems(mcp.Description("One detail"))),
+		mcp.WithArray("decisions_made", mcp.Description("Decisions taken during the work"),
+			mcp.WithStringItems(mcp.Description("One decision (record durable ones via record_decision too)"))),
+		mcp.WithArray("next_steps", mcp.Description("Remaining work / what to do next"),
+			mcp.WithStringItems(mcp.Description("One next step"))),
+		mcp.WithArray("context_keys", mcp.Description("Relevant shared context keys (see list_context)"),
+			mcp.WithStringItems(mcp.Description("A context key"))),
 	), withDeps(deps, handleCompleteTask))
+
+	s.AddTool(mcp.NewTool("get_task",
+		mcp.WithDescription("Get full details of a task: description, progress, completion summary, the "+
+			"structured handoff left by the finishing agent (what was done, what changed, next steps), "+
+			"task notes, and the values of any context keys referenced by the handoff. Read this after "+
+			"claiming a task or before building on a completed one."),
+		mcp.WithString("task_id", mcp.Description("Task id"), mcp.Required()),
+	), withDeps(deps, handleGetTask))
+
+	s.AddTool(mcp.NewTool("add_task_note",
+		mcp.WithDescription("Append a durable note to a task: interface facts, blockers, handoff context, "+
+			"gotchas. Notes are append-only and visible to every agent that views the task — the next "+
+			"claimant reads the task instead of the whole message history. The task must exist."),
+		mcp.WithString("task_id", mcp.Description("Task id to annotate"), mcp.Required()),
+		mcp.WithString("note", mcp.Description("The note, e.g. 'RecovererEnv exposes unix_time(), my_phone_number(), expect_blocking()'"), mcp.Required()),
+		mcp.WithString("agent_id", mcp.Description("Your agent id (optional)")),
+	), withDeps(deps, handleAddTaskNote))
+
+	s.AddTool(mcp.NewTool("get_task_notes",
+		mcp.WithDescription("Read the notes appended to a task, oldest first. Call this after claiming a "+
+			"task to pick up everything previous workers learned."),
+		mcp.WithString("task_id", mcp.Description("Task id"), mcp.Required()),
+	), withDeps(deps, handleGetTaskNotes))
 
 	// ---- messaging ----
 	s.AddTool(mcp.NewTool("send_message",
@@ -175,25 +214,32 @@ func New(deps Deps) *server.MCPServer {
 	s.AddTool(mcp.NewTool("get_briefing",
 		mcp.WithDescription("Get a compact startup briefing for your agent: your task, other active agents "+
 			"with their progress, recent messages, unread messages and important decisions. Call this when "+
-			"you (re)start a session to immediately understand what the team is doing."),
+			"you (re)start a session to immediately understand what the team is doing. "+
+			"Pass since_event_id (from your previous briefing) to get only what changed since then."),
 		mcp.WithString("project_id", mcp.Description("Project id"), mcp.Required()),
 		mcp.WithString("agent_id", mcp.Description("Your agent id"), mcp.Required()),
+		mcp.WithNumber("since_event_id", mcp.Description("Only changes after this event id (delta briefing); omit for a full briefing")),
 	), withDeps(deps, handleBriefing))
 
 	s.AddTool(mcp.NewTool("record_decision",
 		mcp.WithDescription("Record an important implementation decision for the project so other agents "+
-			"don't ask the same question twice. Include the reason — it helps teammates adapt."),
+			"don't ask the same question twice. Include the reason — it helps teammates adapt. "+
+			"When a decision replaces an older one, reference it via supersedes so briefings show only "+
+			"the current decision trail."),
 		mcp.WithString("project_id", mcp.Description("Project id"), mcp.Required()),
 		mcp.WithString("title", mcp.Description("Short decision title, e.g. 'RecovererEnv clock injection'"), mcp.Required()),
 		mcp.WithString("decision", mcp.Description("What was decided"), mcp.Required()),
 		mcp.WithString("reason", mcp.Description("Why — e.g. 'Makes decision-table tests deterministic'")),
 		mcp.WithString("agent_id", mcp.Description("Your agent id (optional)")),
+		mcp.WithNumber("supersedes", mcp.Description("Decision id this one replaces (optional)")),
 	), withDeps(deps, handleRecordDecision))
 
 	s.AddTool(mcp.NewTool("get_decisions",
-		mcp.WithDescription("Retrieve recorded implementation decisions for a project."),
+		mcp.WithDescription("Retrieve recorded implementation decisions for a project. Decisions replaced "+
+			"by a newer one are marked superseded; pass active_only=true to hide them."),
 		mcp.WithString("project_id", mcp.Description("Project id"), mcp.Required()),
 		mcp.WithNumber("limit", mcp.Description("Max decisions (default 20)")),
+		mcp.WithBoolean("active_only", mcp.Description("Hide superseded decisions (default false)")),
 	), withDeps(deps, handleGetDecisions))
 
 	s.AddTool(mcp.NewTool("set_context",
@@ -211,6 +257,16 @@ func New(deps Deps) *server.MCPServer {
 		mcp.WithString("project_id", mcp.Description("Project id"), mcp.Required()),
 		mcp.WithString("key", mcp.Description("Specific key (optional)")),
 	), withDeps(deps, handleGetContext))
+
+	s.AddTool(mcp.NewTool("list_context",
+		mcp.WithDescription("Discover shared project context without knowing exact keys: filter by key "+
+			"prefix (e.g. 'api/') and/or a substring of key or value. Returns key, value and last-updated. "+
+			"Use this before asking a teammate something that may already be recorded."),
+		mcp.WithString("project_id", mcp.Description("Project id"), mcp.Required()),
+		mcp.WithString("prefix", mcp.Description("Key prefix filter, e.g. 'api/' (optional)")),
+		mcp.WithString("search", mcp.Description("Substring to match in key or value (optional)")),
+		mcp.WithNumber("limit", mcp.Description("Max entries (default 50)")),
+	), withDeps(deps, handleListContext))
 
 	return s
 }
@@ -479,7 +535,29 @@ func handleCompleteTask(d *Deps, req mcp.CallToolRequest) string {
 	if taskID == "" || id == "" {
 		return "error: task_id and agent_id are required"
 	}
-	t, err := d.Tasks.Complete(taskID)
+
+	// Handoff mode kicks in when any handoff field is provided.
+	h := &task.Handoff{
+		Summary:       str(args, "summary"),
+		ChangedFiles:  strList(args, "changed_files"),
+		Details:       strList(args, "details"),
+		DecisionsMade: strList(args, "decisions_made"),
+		NextSteps:     strList(args, "next_steps"),
+		ContextKeys:   strList(args, "context_keys"),
+	}
+	hasHandoff := h.Summary != "" || len(h.ChangedFiles) > 0 || len(h.Details) > 0 ||
+		len(h.DecisionsMade) > 0 || len(h.NextSteps) > 0 || len(h.ContextKeys) > 0
+	if hasHandoff && h.Summary == "" {
+		return "error: summary is required when leaving a handoff"
+	}
+
+	var t *task.Task
+	var err error
+	if hasHandoff {
+		t, err = d.Tasks.CompleteWithHandoff(taskID, h.Summary, h)
+	} else {
+		t, err = d.Tasks.Complete(taskID)
+	}
 	if err != nil {
 		return "error: " + err.Error()
 	}
@@ -487,7 +565,121 @@ func handleCompleteTask(d *Deps, req mcp.CallToolRequest) string {
 	d.Hub.Publish(event.TaskCompleted, t.ProjectID, map[string]any{
 		"agent": id, "task": t.TaskID,
 	})
-	return fmt.Sprintf("task %s completed by %s. Other agents in %s have been notified.", taskID, id, t.ProjectID)
+	if !hasHandoff {
+		return fmt.Sprintf("task %s completed by %s. Other agents in %s have been notified.", taskID, id, t.ProjectID)
+	}
+	d.Hub.Publish(event.TaskHandoff, t.ProjectID, map[string]any{
+		"task": t.TaskID, "agent": id, "summary": h.Summary,
+		"handoff": h,
+	})
+	return fmt.Sprintf("task %s completed by %s with handoff. Other agents in %s have been notified; "+
+		"the handoff is available via get_task(task_id=%q).", taskID, id, t.ProjectID, taskID)
+}
+
+func handleGetTask(d *Deps, req mcp.CallToolRequest) string {
+	taskID := str(req.GetArguments(), "task_id")
+	if taskID == "" {
+		return "error: task_id is required"
+	}
+	t, err := d.Tasks.Get(taskID)
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	if t == nil {
+		return "task " + taskID + " not found"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s [%s] — %s\n", t.TaskID, t.Status, t.Title)
+	fmt.Fprintf(&b, "project: %s | assigned: %s | progress: %d%%%s\n",
+		t.ProjectID, orDash(t.AssignedTo), t.Progress, suffix(t.CurrentActivity))
+	if t.Description != "" {
+		fmt.Fprintf(&b, "description: %s\n", t.Description)
+	}
+	if t.CompletionSummary != "" {
+		fmt.Fprintf(&b, "\nCompletion summary: %s\n", t.CompletionSummary)
+	}
+	if t.Handoff != nil {
+		b.WriteString("\nHandoff:\n")
+		writeHandoff(&b, t.Handoff)
+		if len(t.Handoff.ContextKeys) > 0 {
+			b.WriteString("\nContext values:\n")
+			for _, k := range t.Handoff.ContextKeys {
+				entries, err := d.DB.GetContext(t.ProjectID, k)
+				if err != nil || len(entries) == 0 {
+					fmt.Fprintf(&b, "  %s: (no context entry)\n", k)
+					continue
+				}
+				fmt.Fprintf(&b, "  %s: %s\n", k, entries[0].Value)
+			}
+		}
+	}
+	notes, _ := d.Tasks.Notes(taskID, 10)
+	if len(notes) > 0 {
+		b.WriteString("\nNotes:\n")
+		for _, n := range notes {
+			fmt.Fprintf(&b, "- %s%s\n", n.Note, agentSuffix(n.AgentID))
+		}
+	}
+	return b.String()
+}
+
+// writeHandoff renders the handoff compactly for LLM consumption.
+func writeHandoff(b *strings.Builder, h *task.Handoff) {
+	if len(h.ChangedFiles) > 0 {
+		fmt.Fprintf(b, "  changed files: %s\n", strings.Join(h.ChangedFiles, ", "))
+	}
+	writeList := func(label string, items []string) {
+		if len(items) == 0 {
+			return
+		}
+		fmt.Fprintf(b, "  %s:\n", label)
+		for _, item := range items {
+			fmt.Fprintf(b, "    - %s\n", item)
+		}
+	}
+	writeList("details", h.Details)
+	writeList("decisions made", h.DecisionsMade)
+	writeList("next steps", h.NextSteps)
+	if len(h.ContextKeys) > 0 {
+		fmt.Fprintf(b, "  context keys: %s\n", strings.Join(h.ContextKeys, ", "))
+	}
+}
+
+func handleAddTaskNote(d *Deps, req mcp.CallToolRequest) string {
+	args := req.GetArguments()
+	taskID := str(args, "task_id")
+	note := str(args, "note")
+	if taskID == "" || note == "" {
+		return "error: task_id and note are required"
+	}
+	id := agentFrom(args, req, "agent_id")
+	n, err := d.Tasks.AddNote(taskID, "", id, note)
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	d.Hub.Publish(event.TaskNoteAdded, n.ProjectID, map[string]any{
+		"task": n.TaskID, "agent": n.AgentID, "note": n.Note,
+	})
+	return fmt.Sprintf("note #%d added to task %s", n.ID, n.TaskID)
+}
+
+func handleGetTaskNotes(d *Deps, req mcp.CallToolRequest) string {
+	taskID := str(req.GetArguments(), "task_id")
+	if taskID == "" {
+		return "error: task_id is required"
+	}
+	notes, err := d.Tasks.Notes(taskID, 0)
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	if len(notes) == 0 {
+		return "no notes on task " + taskID
+	}
+	var b strings.Builder
+	for _, n := range notes {
+		fmt.Fprintf(&b, "#%d [%s] %s: %s\n", n.ID, n.CreatedAt, orDash(n.AgentID), n.Note)
+	}
+	return b.String()
 }
 
 func taskData(t *task.Task) map[string]any {
@@ -720,6 +912,10 @@ func handleBriefing(d *Deps, req mcp.CallToolRequest) string {
 	if proj == "" || id == "" {
 		return "error: project_id and agent_id are required"
 	}
+	if sinceID := int64(num(args, "since_event_id")); sinceID > 0 {
+		return d.deltaBriefing(proj, id, sinceID)
+	}
+
 	var b strings.Builder
 	fmt.Fprintf(&b, "Project: %s\n\n", proj)
 
@@ -727,10 +923,19 @@ func handleBriefing(d *Deps, req mcp.CallToolRequest) string {
 	if me != nil {
 		if me.CurrentTask != "" {
 			if t, _ := d.Tasks.Get(me.CurrentTask); t != nil {
-				fmt.Fprintf(&b, "Your task:\n%s (%s, %d%%%s)\n\n", t.TaskID, t.Status, t.Progress, suffix(t.CurrentActivity))
+				fmt.Fprintf(&b, "Your task:\n%s (%s, %d%%%s)\n", t.TaskID, t.Status, t.Progress, suffix(t.CurrentActivity))
+				if t.CompletionSummary != "" {
+					fmt.Fprintf(&b, "Completion summary: %s\n", t.CompletionSummary)
+				}
+				if t.Handoff != nil {
+					b.WriteString("Handoff:\n")
+					writeHandoff(&b, t.Handoff)
+				}
+				b.WriteString("\n")
 			} else {
 				fmt.Fprintf(&b, "Your task: %s\n\n", me.CurrentTask)
 			}
+			b.WriteString(taskNotesSection(d, me.CurrentTask))
 		} else {
 			b.WriteString("Your task: none claimed yet. Use list_tasks and claim_task.\n\n")
 		}
@@ -762,20 +967,20 @@ func handleBriefing(d *Deps, req mcp.CallToolRequest) string {
 		b.WriteString("\n")
 	}
 
+	// Recently completed tasks with handoffs: what was done, without reading
+	// the message history. Details via get_task.
+	b.WriteString(recentlyCompleted(d, proj))
+
 	if me != nil {
 		if unread, err := d.Msgs.Unread(id, proj, me.LastMsgID, 100); err == nil && len(unread) > 0 {
 			fmt.Fprintf(&b, "\nYou have %d unread message(s). Use get_messages(unread_only=true, agent_id=%q) to read them.\n", len(unread), id)
 		}
 	}
 
-	if decs, err := d.DB.ListDecisions(proj, 10); err == nil && len(decs) > 0 {
-		b.WriteString("\nImportant decisions:\n")
-		for _, dec := range decs {
-			fmt.Fprintf(&b, "- %s: %s", dec.Title, dec.Decision)
-			if dec.Reason != "" {
-				fmt.Fprintf(&b, " (%s)", dec.Reason)
-			}
-			b.WriteString("\n")
+	if decs, err := d.DB.ListDecisions(proj, 10); err == nil {
+		if active := activeDecisions(decs); len(active) > 0 {
+			b.WriteString("\nImportant decisions:\n")
+			b.WriteString(formatDecisions(active))
 		}
 	}
 
@@ -783,7 +988,133 @@ func handleBriefing(d *Deps, req mcp.CallToolRequest) string {
 		b.WriteString("\nFile overlap warnings:\n")
 		b.WriteString(formatOverlaps(overlaps))
 	}
+
+	if latest, err := d.DB.LatestEventID(proj); err == nil && latest > 0 {
+		fmt.Fprintf(&b, "\nLatest event id: %d. On your next briefing pass it as since_event_id to see only what changed.\n", latest)
+	}
 	return b.String()
+}
+
+// deltaBriefing returns only what changed since the given event id, plus the
+// agent's current task state — cheap to read after a short absence.
+func (d *Deps) deltaBriefing(proj, id string, sinceID int64) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Project: %s — changes since event #%d\n\n", proj, sinceID)
+
+	me, _ := d.Agents.Get(id)
+	if me != nil && me.CurrentTask != "" {
+		if t, _ := d.Tasks.Get(me.CurrentTask); t != nil {
+			fmt.Fprintf(&b, "Your task: %s (%s, %d%%%s)\n\n", t.TaskID, t.Status, t.Progress, suffix(t.CurrentActivity))
+		}
+		if unread, err := d.Msgs.Unread(id, proj, me.LastMsgID, 100); err == nil && len(unread) > 0 {
+			fmt.Fprintf(&b, "You have %d unread message(s). Use get_messages(unread_only=true, agent_id=%q) to read them.\n\n", len(unread), id)
+		}
+	}
+
+	evs, err := d.Hub.Since(proj, sinceID, 100)
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	if len(evs) == 0 {
+		b.WriteString("No changes since then.\n")
+	} else {
+		b.WriteString("Changes:\n")
+		for _, ev := range evs {
+			fmt.Fprintf(&b, "  #%d %s %s %s\n", ev.ID, ev.CreatedAt, ev.Type, compactData(ev.Data))
+		}
+		if len(evs) == 100 {
+			b.WriteString("  (more changes available — call again with since_event_id = ")
+			fmt.Fprintf(&b, "%d)\n", evs[len(evs)-1].ID)
+		}
+	}
+
+	if latest, err := d.DB.LatestEventID(proj); err == nil && latest > 0 {
+		fmt.Fprintf(&b, "\nLatest event id: %d.\n", latest)
+	}
+	return b.String()
+}
+
+// recentlyCompleted summarizes the most recent completed tasks that carry a
+// completion summary or handoff, newest first. Informational only.
+func recentlyCompleted(d *Deps, proj string) string {
+	done, err := d.Tasks.List(proj, task.StatusCompleted, "")
+	if err != nil {
+		return ""
+	}
+	sort.Slice(done, func(i, j int) bool { return done[i].UpdatedAt > done[j].UpdatedAt })
+	lines := []string{}
+	for _, t := range done {
+		if t.CompletionSummary == "" && t.Handoff == nil {
+			continue
+		}
+		summary := t.CompletionSummary
+		if summary == "" && t.Handoff != nil {
+			summary = t.Handoff.Summary
+		}
+		if len(summary) > 100 {
+			summary = summary[:97] + "..."
+		}
+		lines = append(lines, fmt.Sprintf("- %s: %s (details: get_task(task_id=%q))\n", t.TaskID, summary, t.TaskID))
+		if len(lines) == 3 {
+			break
+		}
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("Recently completed:\n")
+	b.WriteString(strings.Join(lines, ""))
+	b.WriteString("\n")
+	return b.String()
+}
+
+// taskNotesSection renders the notes on a task, or "" when there are none.
+func taskNotesSection(d *Deps, taskID string) string {
+	notes, err := d.Tasks.Notes(taskID, 10)
+	if err != nil || len(notes) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Notes on task %s:\n", taskID)
+	for _, n := range notes {
+		fmt.Fprintf(&b, "- %s%s\n", n.Note, agentSuffix(n.AgentID))
+	}
+	b.WriteString("\n")
+	return b.String()
+}
+
+// activeDecisions filters out decisions that a newer one has replaced.
+func activeDecisions(decs []db.Decision) []db.Decision {
+	out := make([]db.Decision, 0, len(decs))
+	for _, dec := range decs {
+		if dec.SupersededBy == 0 {
+			out = append(out, dec)
+		}
+	}
+	return out
+}
+
+func formatDecisions(decs []db.Decision) string {
+	var b strings.Builder
+	for _, dec := range decs {
+		fmt.Fprintf(&b, "- %s: %s", dec.Title, dec.Decision)
+		if dec.Reason != "" {
+			fmt.Fprintf(&b, " (%s)", dec.Reason)
+		}
+		if dec.SupersededBy != 0 {
+			fmt.Fprintf(&b, " [SUPERSEDED by #%d]", dec.SupersededBy)
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+func agentSuffix(agentID string) string {
+	if agentID == "" {
+		return ""
+	}
+	return " (" + agentID + ")"
 }
 
 func agentTaskProgress(d *Deps, a agent.Agent) (int, string) {
@@ -829,9 +1160,7 @@ func (d *Deps) activity(proj string, eventsLimit, msgLimit int, withEvents bool)
 
 	if decs, _ := d.DB.ListDecisions(proj, 10); len(decs) > 0 {
 		b.WriteString("\nRecent decisions:\n")
-		for _, dec := range decs {
-			fmt.Fprintf(&b, "  - %s: %s\n", dec.Title, dec.Decision)
-		}
+		b.WriteString(formatDecisions(activeDecisions(decs)))
 	}
 
 	if withEvents {
@@ -854,18 +1183,24 @@ func handleRecordDecision(d *Deps, req mcp.CallToolRequest) string {
 		return "error: project_id, title and decision are required"
 	}
 	dec, err := d.DB.RecordDecision(db.Decision{
-		ProjectID: proj,
-		Title:     title,
-		Decision:  decision,
-		Reason:    str(args, "reason"),
-		AgentID:   str(args, "agent_id"),
+		ProjectID:  proj,
+		Title:      title,
+		Decision:   decision,
+		Reason:     str(args, "reason"),
+		AgentID:    str(args, "agent_id"),
+		Supersedes: int64(num(args, "supersedes")),
 	})
 	if err != nil {
 		return "error: " + err.Error()
 	}
 	d.Hub.Publish(event.DecisionCreated, proj, map[string]any{
-		"id": dec.ID, "title": dec.Title, "decision": dec.Decision, "reason": dec.Reason, "agent": dec.AgentID,
+		"id": dec.ID, "title": dec.Title, "decision": dec.Decision, "reason": dec.Reason,
+		"agent": dec.AgentID, "supersedes": dec.Supersedes,
 	})
+	if dec.Supersedes != 0 {
+		return fmt.Sprintf("decision #%d recorded: %s (supersedes #%d — briefings now show only the new decision)",
+			dec.ID, dec.Title, dec.Supersedes)
+	}
 	return fmt.Sprintf("decision #%d recorded: %s", dec.ID, dec.Title)
 }
 
@@ -879,6 +1214,9 @@ func handleGetDecisions(d *Deps, req mcp.CallToolRequest) string {
 	if err != nil {
 		return "error: " + err.Error()
 	}
+	if boolean(args, "active_only") {
+		decs = activeDecisions(decs)
+	}
 	if len(decs) == 0 {
 		return "no decisions recorded for " + proj
 	}
@@ -890,6 +1228,12 @@ func handleGetDecisions(d *Deps, req mcp.CallToolRequest) string {
 		}
 		if dec.AgentID != "" {
 			fmt.Fprintf(&b, "  by: %s\n", dec.AgentID)
+		}
+		if dec.Supersedes != 0 {
+			fmt.Fprintf(&b, "  supersedes: #%d\n", dec.Supersedes)
+		}
+		if dec.SupersededBy != 0 {
+			fmt.Fprintf(&b, "  SUPERSEDED by: #%d\n", dec.SupersededBy)
 		}
 	}
 	return b.String()
@@ -925,6 +1269,26 @@ func handleGetContext(d *Deps, req mcp.CallToolRequest) string {
 	var b strings.Builder
 	for _, e := range entries {
 		fmt.Fprintf(&b, "%s: %s\n", e.Key, e.Value)
+	}
+	return b.String()
+}
+
+func handleListContext(d *Deps, req mcp.CallToolRequest) string {
+	args := req.GetArguments()
+	proj := str(args, "project_id")
+	if proj == "" {
+		return "error: project_id is required"
+	}
+	entries, err := d.DB.SearchContext(proj, str(args, "prefix"), str(args, "search"), num(args, "limit"))
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	if len(entries) == 0 {
+		return "no context matches for " + proj
+	}
+	var b strings.Builder
+	for _, e := range entries {
+		fmt.Fprintf(&b, "%s: %s (updated %s)\n", e.Key, e.Value, e.UpdatedAt)
 	}
 	return b.String()
 }

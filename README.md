@@ -112,15 +112,23 @@ Then, at session start, the agent calls (in any order):
 
 1. `register_agent(agent_id, name, project_id=...)` — persistent identity
 2. `get_briefing(project_id, agent_id)` — compact startup briefing
+   (pass the `since_event_id` from your last briefing to see only what changed)
 3. `list_tasks(project_id)`, `claim_task(task_id, agent_id)` — start working
    immediately; tasks never block each other
-4. `update_progress(task_id, progress, activity, agent_id)` — broadcast
+4. `get_task_notes(task_id)` — pick up what previous workers learned
+5. `update_progress(task_id, progress, activity, agent_id)` — broadcast
    progress to the team
-5. `ask_agent(...)`, `send_message(...)`, `reply_message(...)` — coordinate
-6. `record_decision(...)` — publish decisions; others read them instead of
-   re-asking
-7. `set_files(agent_id, files)` — file awareness / overlap warnings
-8. `set_context` / `get_context` — shared key/value project memory
+6. `ask_agent(...)`, `send_message(...)`, `reply_message(...)` — coordinate
+7. `add_task_note(task_id, note, agent_id)` — record durable facts
+   (interfaces, blockers, gotchas) on the task itself
+8. `complete_task(..., summary, changed_files, next_steps, ...)` — complete
+   with a structured handoff: what was done, what changed, what matters,
+   what to do next. Informational only — it never blocks other tasks.
+9. `record_decision(...)` — publish decisions; others read them instead of
+   re-asking; supersede older decisions with `supersedes=<decision id>`
+10. `set_files(agent_id, files)` — file awareness / overlap warnings
+11. `set_context` / `get_context` / `list_context` — shared project memory
+    (searchable by prefix and substring)
 
 If the client supports custom HTTP headers, set `X-Agent-Id: agent-1` and
 most tools can omit the `agent_id` argument.
@@ -169,15 +177,18 @@ An agent that only speaks MCP (no WebSocket) still works: use
 | `list_tasks` / `create_task` | task state |
 | `claim_task` | start a task (never blocks) |
 | `update_progress` | progress % + activity, pushed to the team |
-| `complete_task` | mark done |
+| `complete_task` | mark done; optionally leave a structured handoff |
+| `get_task` | task details: handoff, completion summary, notes, context values |
+| `add_task_note` / `get_task_notes` | durable per-task knowledge (interfaces, blockers, handoffs) |
 | `send_message` | direct (1 or many) or broadcast, 10 message types |
 | `ask_agent` | question with thread |
 | `reply_message` | answer, inherits thread |
 | `get_messages` / `mark_read` | inbox + offline delivery |
 | `get_project_activity` | full live picture of the project |
-| `get_briefing` | startup briefing for a (re)starting agent |
-| `record_decision` / `get_decisions` | shared decisions |
+| `get_briefing` | startup briefing; with `since_event_id`, only what changed since |
+| `record_decision` / `get_decisions` | shared decisions; new decisions may supersede old ones |
 | `set_context` / `get_context` | shared key/value context |
+| `list_context` | discover context by key prefix and/or key/value substring |
 
 Message types: `message`, `question`, `answer`, `progress`, `instruction`,
 `decision`, `warning`, `interface_change`, `blocked`, `completed`.
@@ -228,7 +239,7 @@ agentwire/
 │   ├── message/           messaging, threads, unread delivery
 │   ├── event/             in-process hub + SQLite persistence
 │   ├── websocket/         auth, heartbeat, push, offline replay
-│   └── mcp/               MCP tools (20 tools)
+│   └── mcp/               MCP tools (24 tools)
 ├── go.mod
 ├── README.md
 └── ARCHITECTURE.md
