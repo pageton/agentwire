@@ -17,7 +17,7 @@ func newStore(t *testing.T) *Store {
 	return NewStore(database)
 }
 
-func TestSendAndRelevance(t *testing.T) {
+func TestSendBasics(t *testing.T) {
 	s := newStore(t)
 
 	bcast, err := s.Send(Message{ProjectID: "p", FromAgent: "agent-1", Content: "hello all"})
@@ -27,22 +27,23 @@ func TestSendAndRelevance(t *testing.T) {
 	if bcast.ID == 0 {
 		t.Fatal("no id")
 	}
-	if !bcast.Relevant("agent-2", "p") {
-		t.Fatal("broadcast should be relevant to every agent in the project")
-	}
-	if bcast.Relevant("agent-2", "other") {
-		t.Fatal("broadcast must not leak across projects")
+	if bcast.ToAgent != Broadcast {
+		t.Fatalf("broadcast should have empty to_agent, got %q", bcast.ToAgent)
 	}
 
 	direct, err := s.Send(Message{ProjectID: "p", FromAgent: "agent-1", ToAgent: "agent-2", Content: "for you"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !direct.Relevant("agent-2", "p") {
-		t.Fatal("direct message should be relevant to the recipient")
+	if direct.ToAgent != "agent-2" {
+		t.Fatalf("direct message lost its recipient: %q", direct.ToAgent)
 	}
-	if direct.Relevant("agent-3", "p") {
-		t.Fatal("direct message must not be relevant to others")
+	got, err := s.Get(direct.ID)
+	if err != nil || got == nil {
+		t.Fatalf("get: %v %v", got, err)
+	}
+	if got.Content != "for you" {
+		t.Fatalf("roundtrip mismatch: %q", got.Content)
 	}
 }
 
@@ -70,35 +71,6 @@ func TestReplyThreading(t *testing.T) {
 	}
 	if r2.ThreadID != q.ID || r2.ReplyTo != reply.ID {
 		t.Fatalf("nested reply lost thread: %+v", r2)
-	}
-}
-
-func TestUnreadDelivery(t *testing.T) {
-	s := newStore(t)
-
-	// Messages before the cursor are delivered; after are unread.
-	m1, _ := s.Send(Message{ProjectID: "p", FromAgent: "a1", ToAgent: "a2", Content: "one"})
-	_ = m1
-	m2, _ := s.Send(Message{ProjectID: "p", FromAgent: "a1", Content: "bcast two"})
-	_, _ = s.Send(Message{ProjectID: "p", FromAgent: "a3", ToAgent: "a4", Content: "not for you"})
-
-	unread, err := s.Unread("a2", "p", m1.ID, 100)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// m2 (broadcast) and m3 (after cursor) — but m3 is not relevant to a2.
-	if len(unread) != 1 || unread[0].ID != m2.ID {
-		t.Fatalf("unread = %+v", unread)
-	}
-
-	// Deliver: cursor advances past everything.
-	max, _ := s.MaxID()
-	unread, err = s.Unread("a2", "p", max, 100)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(unread) != 0 {
-		t.Fatalf("expected no unread after delivery, got %+v", unread)
 	}
 }
 

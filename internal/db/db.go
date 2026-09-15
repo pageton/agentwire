@@ -35,7 +35,6 @@ var statements = []string{
 		project_id   TEXT NOT NULL DEFAULT '',
 		current_task TEXT NOT NULL DEFAULT '',
 		files        TEXT NOT NULL DEFAULT '[]',
-		last_msg_id  INTEGER NOT NULL DEFAULT 0,
 		last_seen    TEXT NOT NULL,
 		created_at   TEXT NOT NULL
 	);`,
@@ -105,12 +104,24 @@ var statements = []string{
 		created_at TEXT NOT NULL
 	);`,
 
+	`CREATE TABLE IF NOT EXISTS inbox (
+		event_id   INTEGER NOT NULL,
+		agent_id   TEXT NOT NULL,
+		type       TEXT NOT NULL,
+		project_id TEXT NOT NULL DEFAULT '',
+		data       TEXT NOT NULL DEFAULT '{}',
+		acked      INTEGER NOT NULL DEFAULT 0,
+		created_at TEXT NOT NULL,
+		PRIMARY KEY (event_id, agent_id)
+	);`,
+
 	`CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);`,
 	`CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assigned_to);`,
 	`CREATE INDEX IF NOT EXISTS idx_messages_project ON messages(project_id, id);`,
 	`CREATE INDEX IF NOT EXISTS idx_decisions_project ON decisions(project_id);`,
 	`CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id, id);`,
 	`CREATE INDEX IF NOT EXISTS idx_task_notes_task ON task_notes(task_id);`,
+	`CREATE INDEX IF NOT EXISTS idx_inbox_agent_unacked ON inbox(agent_id, acked, event_id);`,
 }
 
 // Open opens (or creates) the SQLite database at path, enables WAL mode and
@@ -506,8 +517,9 @@ func (s *Store) LatestEventID(projectID string) (int64, error) {
 	return id.Int64, nil
 }
 
-// Counts returns (agents, online agents, tasks, messages, decisions, events).
-func (s *Store) Counts() (agents, online, tasks, messages, decisions, events int, err error) {
+// Counts returns (agents, online agents, tasks, messages, decisions, events,
+// unacknowledged inbox rows).
+func (s *Store) Counts() (agents, online, tasks, messages, decisions, events, unacked int, err error) {
 	queries := []struct {
 		q    string
 		dest *int
@@ -518,6 +530,7 @@ func (s *Store) Counts() (agents, online, tasks, messages, decisions, events int
 		{`SELECT COUNT(*) FROM messages`, &messages},
 		{`SELECT COUNT(*) FROM decisions`, &decisions},
 		{`SELECT COUNT(*) FROM events`, &events},
+		{`SELECT COUNT(*) FROM inbox WHERE acked = 0`, &unacked},
 	}
 	for _, q := range queries {
 		if err = s.DB.QueryRow(q.q).Scan(q.dest); err != nil {

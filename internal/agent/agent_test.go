@@ -40,7 +40,7 @@ func TestRegisterUpsertPreservesPresence(t *testing.T) {
 	}
 }
 
-func TestPresenceAndCursor(t *testing.T) {
+func TestPresence(t *testing.T) {
 	s := newStore(t)
 	if err := s.Register(Agent{AgentID: "a1", Name: "x", Status: StatusOffline}); err != nil {
 		t.Fatal(err)
@@ -48,14 +48,8 @@ func TestPresenceAndCursor(t *testing.T) {
 	if err := s.SetPresence("a1", StatusOnline); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.AdvanceCursor("a1", 5); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.AdvanceCursor("a1", 3); err != nil {
-		t.Fatal(err) // cursor never moves backwards
-	}
 	a, _ := s.Get("a1")
-	if a.Status != StatusOnline || a.LastMsgID != 5 {
+	if a.Status != StatusOnline {
 		t.Fatalf("state wrong: %+v", a)
 	}
 	if a.LastSeen == "" {

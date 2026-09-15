@@ -5,9 +5,9 @@ Small, boring, single-process Go. The whole system is:
 ```
 agents (LLMs) ── MCP tools ──► SQLite  ◄── CLI (status/agents/tasks/activity)
        │                          │
-       │                     event hub (in-process)
+       │                     event hub (in-process) ──► inbox (per-agent, ack-based)
        │                          │
-       └── WebSocket ── live push / presence / offline replay
+       └── WebSocket ── live push / presence / inbox replay
 ```
 
 ## Principles
@@ -20,8 +20,12 @@ agents (LLMs) ── MCP tools ──► SQLite  ◄── CLI (status/agents/ta
    records.
 3. **Parallel by default.** Tasks have no execution dependencies. Claiming a
    task never waits. Coordination happens through messages.
-4. **Push, not polling.** Live updates travel over WebSocket. Offline agents
-   get exact replay on reconnect.
+4. **Push, not polling.** Live updates travel over WebSocket. The durable
+   inbox holds events until the agent *acknowledges* them; reconnecting
+   agents get exact replay of everything unacknowledged. WebSocket delivers
+   in real time — it never interrupts an LLM generation; the agent's
+   adapter/runtime injects incoming events at the next turn and acks after
+   the LLM consumed them.
 
 ## Components
 
@@ -34,7 +38,7 @@ timeout turns concurrent writers into waiters). Applies the schema:
 ```
 projects   (id, name, created_at)
 agents     (agent_id, name, type, status, project_id, current_task,
-            files JSON, last_msg_id, last_seen, created_at)
+            files JSON, last_seen, created_at)
 tasks      (task_id, project_id, title, description, status,
             assigned_to, created_by, progress, current_activity,
             completion_summary, handoff JSON, created_at, updated_at)
@@ -44,6 +48,8 @@ decisions  (id, project_id, title, decision, reason, agent_id,
             supersedes, created_at)
 context    (project_id, key, value, created_at, updated_at)
 events     (id, type, project_id, data JSON, created_at)
+inbox      (event_id, agent_id, type, project_id, data JSON, acked,
+            created_at, PK (event_id, agent_id))
 task_notes (id, task_id, project_id, agent_id, note, created_at)
 ```
 
@@ -57,12 +63,11 @@ small idempotent migration in `Open` (checked via `PRAGMA table_info`).
 ### `internal/agent`
 
 Persistent identities. `Register` is an upsert that updates identity metadata
-(name, type, project) but **never clobbers presence or the delivery cursor**
-— the identity must survive reconnects and restarts.
+(name, type, project) but **never clobbers presence** — the identity must
+survive reconnects and restarts.
 
 - `SetPresence(online|offline)` + `last_seen`
 - `SetFiles([]string)` — files currently being modified (JSON column)
-- `AdvanceCursor / SetCursor` — offline delivery cursor
 - `Overlaps(project)` — files touched by more than one agent (warning only)
 
 ### `internal/task`
@@ -99,16 +104,40 @@ pending → working → completed
   thread. The thread root is the id of the thread's first message
   (`thread_id = parent.thread_id`, or `parent.id` when the parent has no
   thread).
-- `Relevant(msg, agent, project)` — delivered to me, or broadcast to my
-  project.
-- `Unread(agent, project, cursor, limit)` — `id > cursor AND relevant`.
+- `List(project, agent, limit)` — recent history, optionally scoped to an
+  agent's inbox.
+
+### `internal/inbox`
+
+The durable per-agent inbox — the delivery guarantee of the agent protocol.
+One row per (event, agent), stored in SQLite, acknowledged explicitly.
+
+- `Add(eventID, type, project, dataJSON, agents)` — one unacknowledged row
+  per recipient, then wakes any `wait_for_events` waiters for them.
+- `Unacked(agent, limit)` / `UnackedCount(agent)` — read the inbox, oldest
+  first (ordered by global event id).
+- `AckThrough(agent, eventID)` / `AckAll(agent)` — acknowledgement; acked
+  rows are never re-delivered.
+- `Wait(ctx, agent, timeout)` — block until new inbox rows arrive, the
+  timeout elapses, or ctx is done. Event-driven (woken by `Add`), no DB
+  polling.
+
+Delivery semantics: **at-least-once until acknowledged**. Real-time push
+over WebSocket, replay on reconnect, `wait_for_events` for MCP-only agents.
+A WebSocket frame can never interrupt an LLM generation — the agent's
+adapter/runtime injects inbox events at the next turn and acks after the
+LLM consumed them.
 
 ### `internal/event`
 
 The in-process hub. `Publish(type, projectID, data)`:
 
 1. inserts the event into SQLite (`events` table) — persistence first,
-2. fans out to subscribers (buffered chan, non-blocking send).
+2. delivers inbox-relevant events into the inbox of every agent they
+   concern (message events → the addressed agent or everyone on broadcast;
+   progress/task/decision events → everyone in the project except the
+   originator),
+3. fans out to subscribers (buffered chan, non-blocking send).
 
 A slow subscriber is dropped for real-time purposes but loses nothing — it
 can replay from SQLite. Events:
@@ -124,8 +153,10 @@ decision.created
 warning.file_overlap
 ```
 
-`message.created` carries the full message in `data` so the WebSocket layer
-can decide relevance without a DB round-trip.
+Inbox-relevant events (message/question/answer/instruction/interface_change
+sent, task.progress, task.completed, task.handoff, decision.created) carry
+the full payload in the inbox row's `data`, so replay and `get_unread` need
+no follow-up queries.
 
 ### `internal/websocket`
 
@@ -142,27 +173,38 @@ Per connection:
   `agent.connected` + `agent.status_changed`. A new connection for the same
   agent replaces the old one (last wins). On close, the agent goes
   `offline` and `agent.disconnected` is published.
-- **Replay** — once, right after bind: unread messages addressed to the
-  agent, recent project events, the agent roster, recent decisions. The
-  cursor advances to the last replayed message.
+- **Replay** — once, right after bind: every unacknowledged inbox event
+  for the agent, recent project events, the agent roster, recent decisions.
+  Nothing is acknowledged by the replay — it re-delivers.
 - **Heartbeat** — control-frame ping every 30 s (browsers and gorilla
   clients answer automatically); read deadline 75 s refreshed by any read
   or pong. App-level `{"type":"ping"}` → `{"type":"pong"}` also supported.
 - **Live push** — a hub subscription filters events by project (anonymous
   listeners get everything). Each event is wrapped as
-  `{"type":"event","event":{…}}`. When the event is a `message.created`
-  relevant to the agent, the delivery cursor advances — delivery over the
-  socket counts as delivered.
+  `{"type":"event","event":{…}}`. Push is real-time transport only: it
+  never acks. The client acks with `{"type":"ack","event_id":N}` (omit
+  `event_id` to ack everything) once its LLM has processed the events.
 - Writers are serialized through a per-client send channel; slow consumers
   drop (replayable), never block the hub.
 
 ### `internal/mcp`
 
-24 tools on top of the stores + hub (see README). Transport: **streamable
+27 tools on top of the stores + hub (see README). Transport: **streamable
 HTTP** at `/mcp` (modern clients) and **legacy SSE** at `/sse` for older
 ones. Identity is an explicit `agent_id` argument (works with stdio-style
 clients too); clients that send HTTP headers may use `X-Agent-Id` as a
 fallback. Tool results are compact text, formatted for LLM consumption.
+
+Inbox tools (the agent protocol surface):
+
+- **`get_unread`** — the unacknowledged inbox, oldest first.
+- **`ack_event`** — acknowledge through an event id, or everything.
+- **`wait_for_events`** — event-driven long-poll: blocks until new inbox
+  rows arrive or the timeout elapses (default 30 s, max 60 s). The handler
+  holds the request context, so a disconnecting client stops the wait.
+- `get_messages(unread_only=true)` reads the message-type subset of the
+  inbox; `mark_read` is `ack_event` without an event id — one inbox, one
+  ack, two reading surfaces.
 
 Knowledge helpers on top of the primitives:
 
@@ -201,27 +243,38 @@ Agent 1 → MCP send_message ──► message.Store.Send ──► SQLite (mess
                                         │
                      ┌──────────────────┴─────────────────┐
                      │                                    │
-             SQLite (events)                    fan-out to WS subscribers
-                                                        │
-                                         Agent 2 online? ──► push event,
-                                         advance cursor        live
-                                         Agent 2 offline ──► nothing; the
-                                         row waits in SQLite
+              SQLite (events)                    inbox.Add (SQLite inbox rows
+                     │                          for every recipient) + wake
+                     │                          wait_for_events waiters
+                     │                                    │
+                     └──────── fan-out to WS subscribers ─┤
+                                                          │
+                                          Agent 2 online? ──► push event
+                                          envelope, live (no ack)
+                                          Agent 2 offline ──► the unacked
+                                          inbox row waits in SQLite
 ```
 
 Reconnect of Agent 2:
 
 ```
 WS connect → bind identity → presence online → replay:
-   messages where id > last_msg_id AND relevant  (delivered + cursor advanced)
+   inbox rows where acked = 0 AND agent = me   (re-delivered, not acked)
    recent events (project)
    agents (roster)
    decisions
 → live subscription active
 ```
 
-Result: **no message loss, no duplication** — verified end-to-end (a message
-delivered live is never replayed; a message missed while offline is).
+Agent 2's adapter injects the events at the next LLM turn and acks
+(`{"type":"ack","event_id":N}` over WS, or the `ack_event` tool):
+
+```
+ack → inbox rows acked = 1 → never re-delivered
+```
+
+Result: **at-least-once delivery until acknowledged** — no message is ever
+lost, and every unacknowledged event is re-delivered on reconnect.
 
 ## Progress flow
 
@@ -229,11 +282,14 @@ delivered live is never replayed; a message missed while offline is).
 Agent 1 → MCP update_progress ──► tasks row (progress, activity)
                         └─► event.Hub.Publish("task.progress")
                                         │
+                              inbox rows for every other agent
+                              in the project (originator excluded)
+                                        │
                               WS push to all project subscribers:
                               {"type":"event","event":{
                                  "type":"task.progress","project_id":"td-rs",
-                                 "data":{"agent":"agent-1","task":"M.3.7.1",
-                                         "progress":70,"activity":"…"}}}
+                                 "data":{"agent":"agent-1","task_id":"M.3.7.1",
+                                         "progress":70,"current_activity":"…"}}}
 ```
 
 ## File overlap
@@ -250,5 +306,8 @@ AgentWire never locks or merges files — visibility only.
 - The "broker" is a `map[string]*client` with a mutex, plus one buffered
   channel per connection.
 - Events are persisted and fanned out by the same `Publish` call; replay is
-  a plain SQL query.
+  a plain SQL query; `wait_for_events` is a map of agent id → waiter
+  channels, woken by the inbox insert.
 - No framework beyond the MCP and WebSocket protocol libraries.
+- No Redis, no Kafka, no message queue — SQLite WAL and in-process channels
+  cover it.

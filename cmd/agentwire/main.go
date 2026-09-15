@@ -26,6 +26,7 @@ import (
 	"agentwire/internal/agent"
 	"agentwire/internal/db"
 	"agentwire/internal/event"
+	"agentwire/internal/inbox"
 	agentmcp "agentwire/internal/mcp"
 	"agentwire/internal/message"
 	"agentwire/internal/task"
@@ -110,11 +111,13 @@ func runStart() error {
 	agents := agent.NewStore(database)
 	tasks := task.NewStore(database)
 	msgs := message.NewStore(database)
+	inbx := inbox.NewStore(database)
 	hub := event.NewHub(database)
+	hub.SetInbox(inbx)
 
-	wsServer := agentws.NewServer(database, hub, agents, tasks, msgs, token)
+	wsServer := agentws.NewServer(database, hub, agents, tasks, msgs, inbx, token)
 	mcpServer := agentmcp.New(agentmcp.Deps{
-		DB: database, Hub: hub, Agents: agents, Tasks: tasks, Msgs: msgs,
+		DB: database, Hub: hub, Agents: agents, Tasks: tasks, Msgs: msgs, Inbox: inbx,
 	})
 
 	streamable := server.NewStreamableHTTPServer(mcpServer,
@@ -211,7 +214,7 @@ func runStatus() error {
 	}
 	defer database.Close()
 
-	agents, online, nTasks, nMsgs, nDecs, nEvents, err := database.Counts()
+	agents, online, nTasks, nMsgs, nDecs, nEvents, unacked, err := database.Counts()
 	if err != nil {
 		return err
 	}
@@ -238,6 +241,7 @@ func runStatus() error {
 	fmt.Printf("  messages: %d\n", nMsgs)
 	fmt.Printf("  decisions: %d\n", nDecs)
 	fmt.Printf("  events:   %d\n", nEvents)
+	fmt.Printf("  inbox:    %d unacknowledged\n", unacked)
 	return nil
 }
 

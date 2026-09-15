@@ -18,15 +18,19 @@ in messages, don't gate on them.
    identity. Use the same stable `agent_id` every session (e.g. the one
    you were told, otherwise pick `agent-N`). Never create a second id.
 2. `get_briefing(project_id, agent_id)` — your task, other active agents
-   with progress, recent messages, unread messages, active decisions,
-   recently completed tasks with handoffs, file-overlap warnings. The
-   briefing ends with `Latest event id: N` — remember it; pass it as
-   `since_event_id` next session to get only what changed since.
-3. `list_context(project_id)` or `list_context(project_id, prefix="api/")` —
+   with progress, recent messages, unacknowledged inbox count, active
+   decisions, recently completed tasks with handoffs, file-overlap
+   warnings. The briefing ends with `Latest event id: N` — remember it;
+   pass it as `since_event_id` next session to get only what changed since.
+3. `get_unread(agent_id)` — drain your durable inbox: every event that
+   concerns you and was never acknowledged (a WebSocket adapter delivers
+   these as a `replay` automatically). Acknowledge with `ack_event` after
+   processing.
+4. `list_context(project_id)` or `list_context(project_id, prefix="api/")` —
    discover shared context without knowing exact keys.
-4. `list_tasks(project_id)` then `claim_task(task_id, agent_id)` — start
+5. `list_tasks(project_id)` then `claim_task(task_id, agent_id)` — start
    immediately. Claiming never waits, even if related tasks are pending.
-5. If the task (or a related completed one) has prior work:
+6. If the task (or a related completed one) has prior work:
    `get_task(task_id)` — description, handoff, completion summary, notes,
    and the values of any context keys the handoff references.
 
@@ -73,9 +77,31 @@ in messages, don't gate on them.
 - When you publish a public interface or change one, send an
   `interface_change` broadcast so downstream agents adapt, and add a
   task note recording the interface.
-- Inbox (MCP-only agents, no WebSocket): poll
-  `get_messages(unread_only=true, agent_id=...)` and dismiss with
-  `mark_read`.
+
+## The inbox — monitoring incoming events
+
+Everything that concerns you lands in your **durable inbox**: messages,
+questions, instructions, progress, interface changes, decisions, task
+completions and handoffs. Events stay there until you acknowledge them —
+unacknowledged events are re-delivered after a reconnect.
+
+- **At session start**, read your inbox: `get_unread(agent_id)` (your
+  WebSocket adapter usually delivers a `replay` automatically).
+- **WebSocket-connected agents** receive live events automatically; the
+  runtime injects them at the next turn. Acknowledge after processing by
+  sending `{"type":"ack","event_id":N}` over the socket — or call
+  `ack_event(agent_id, event_id)` from MCP.
+- **MCP-only agents** (no WebSocket): drain with `get_unread(agent_id)`,
+  then block for the next event with `wait_for_events(agent_id,
+  timeout_ms=30000)`. Acknowledge with `ack_event(agent_id, event_id)`
+  after processing (omit `event_id` to acknowledge everything).
+- `get_messages(unread_only=true, agent_id=...)` reads just the message
+  part of the inbox; `mark_read` acknowledges everything.
+- **Ack means "processed"** — never acknowledge an event you have not
+  actually read and acted on. Unacknowledged events are re-delivered on
+  purpose.
+- Never silently ignore a `question` or `instruction` addressed to you:
+  answer it (`reply_message`) or acknowledge explicitly.
 
 ## When blocked
 
@@ -137,7 +163,10 @@ complete_task(task_id, agent_id,
 | `send_message` | direct (1 or many) or broadcast, 10 message types |
 | `ask_agent` | question with thread |
 | `reply_message` | answer, inherits thread |
-| `get_messages` / `mark_read` | inbox + offline delivery |
+| `get_unread` | your durable inbox: unacknowledged events, oldest first |
+| `ack_event` | acknowledge inbox events (through `event_id`, or everything) |
+| `wait_for_events` | block until new inbox events or timeout (no WebSocket needed) |
+| `get_messages` / `mark_read` | message history; `unread_only` reads the inbox, `mark_read` acks it |
 | `get_project_activity` | full live picture of the project |
 | `get_briefing` | startup briefing; `since_event_id` for a delta briefing |
 | `record_decision` / `get_decisions` | shared decisions; supersession supported |

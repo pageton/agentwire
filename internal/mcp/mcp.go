@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -15,11 +16,12 @@ import (
 	"agentwire/internal/agent"
 	"agentwire/internal/db"
 	"agentwire/internal/event"
+	"agentwire/internal/inbox"
 	"agentwire/internal/message"
 	"agentwire/internal/task"
 )
 
-const serverVersion = "0.1.0"
+const serverVersion = "0.2.0"
 
 // Deps bundles the stores and hub the tools operate on.
 type Deps struct {
@@ -28,6 +30,7 @@ type Deps struct {
 	Agents *agent.Store
 	Tasks  *task.Store
 	Msgs   *message.Store
+	Inbox  *inbox.Store
 }
 
 // New builds the MCP server with all AgentWire tools registered.
@@ -188,8 +191,8 @@ func New(deps Deps) *server.MCPServer {
 
 	s.AddTool(mcp.NewTool("get_messages",
 		mcp.WithDescription("Read messages. With unread_only=true returns only messages addressed to you "+
-			"(or broadcast) that you have not seen yet — call mark_read afterwards to dismiss them. "+
-			"With unread_only=false returns recent project history."),
+			"(or broadcast) that are still unacknowledged in your inbox — call mark_read or ack_event "+
+			"afterwards to acknowledge them. With unread_only=false returns recent project history."),
 		mcp.WithString("project_id", mcp.Description("Project id (optional, all projects if omitted)")),
 		mcp.WithString("agent_id", mcp.Description("Agent id whose inbox to read (optional)")),
 		mcp.WithBoolean("unread_only", mcp.Description("Only messages not yet delivered to the agent (default false)")),
@@ -197,12 +200,38 @@ func New(deps Deps) *server.MCPServer {
 	), withDeps(deps, handleGetMessages))
 
 	s.AddTool(mcp.NewTool("mark_read",
-		mcp.WithDescription("Mark messages as seen by your agent: everything up to 'message_id' is "+
-			"considered delivered, or everything when message_id is omitted. Useful after reading "+
-			"unread messages via get_messages."),
+		mcp.WithDescription("Acknowledge your whole inbox: mark every unacknowledged inbox event as seen "+
+			"(equivalent to ack_event without an event_id). Useful after reading unread messages via "+
+			"get_messages."),
 		mcp.WithString("agent_id", mcp.Description("Your agent id"), mcp.Required()),
-		mcp.WithNumber("message_id", mcp.Description("Mark all messages up to and including this id as read (optional)")),
 	), withDeps(deps, handleMarkRead))
+
+	// ---- inbox (real-time agent protocol) ----
+	s.AddTool(mcp.NewTool("get_unread",
+		mcp.WithDescription("Read your inbox: every project event that concerns you and has not been "+
+			"acknowledged yet — messages, questions, instructions, progress, interface changes, "+
+			"decisions, task completions and task handoffs. Oldest first. Acknowledge with ack_event "+
+			"after processing; unacknowledged events are re-delivered after a reconnect."),
+		mcp.WithString("agent_id", mcp.Description("Your agent id"), mcp.Required()),
+		mcp.WithNumber("limit", mcp.Description("Max events (default 50)")),
+	), withDeps(deps, handleGetUnread))
+
+	s.AddTool(mcp.NewTool("ack_event",
+		mcp.WithDescription("Acknowledge inbox events: mark the event 'event_id' and everything older as "+
+			"processed, or every event when event_id is omitted. Acknowledged events are never "+
+			"re-delivered. WebSocket-connected agents can instead send {\"type\":\"ack\",\"event_id\":N}."),
+		mcp.WithString("agent_id", mcp.Description("Your agent id"), mcp.Required()),
+		mcp.WithNumber("event_id", mcp.Description("Acknowledge this event and all older unacknowledged events (optional)")),
+	), withDeps(deps, handleAckEvent))
+
+	s.AddTool(mcp.NewTool("wait_for_events",
+		mcp.WithDescription("Block until new inbox events for your agent arrive or the timeout elapses. "+
+			"Returns unacknowledged inbox events immediately when any are pending. Event-driven — for "+
+			"agents without a WebSocket connection, the way to wait for the next event instead of "+
+			"repeatedly calling get_unread."),
+		mcp.WithString("agent_id", mcp.Description("Your agent id"), mcp.Required()),
+		mcp.WithNumber("timeout_ms", mcp.Description("Max wait in milliseconds (default 30000, max 60000)")),
+	), withDepsCtx(deps, handleWaitForEvents))
 
 	// ---- shared state ----
 	s.AddTool(mcp.NewTool("get_project_activity",
@@ -276,6 +305,20 @@ type toolFn func(d *Deps, req mcp.CallToolRequest) string
 func withDeps(d Deps, h toolFn) server.ToolHandlerFunc {
 	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		out := h(&d, req)
+		if strings.HasPrefix(out, "error:") {
+			return mcp.NewToolResultError(strings.TrimPrefix(out, "error: ")), nil
+		}
+		return mcp.NewToolResultText(out), nil
+	}
+}
+
+// withDepsCtx is withDeps for handlers that need the request context
+// (wait_for_events blocks until ctx, timeout or new inbox events).
+type toolFnCtx func(ctx context.Context, d *Deps, req mcp.CallToolRequest) string
+
+func withDepsCtx(d Deps, h toolFnCtx) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		out := h(ctx, &d, req)
 		if strings.HasPrefix(out, "error:") {
 			return mcp.NewToolResultError(strings.TrimPrefix(out, "error: ")), nil
 		}
@@ -515,15 +558,19 @@ func handleUpdateProgress(d *Deps, req mcp.CallToolRequest) string {
 	if err != nil {
 		return "error: " + err.Error()
 	}
+	if t == nil {
+		return "error: task " + taskID + " not found"
+	}
 	typ := event.TaskProgress
 	if t.Status == task.StatusBlocked {
 		typ = event.TaskBlocked
 	} else if t.Status == task.StatusCompleted {
 		typ = event.TaskCompleted
 	}
-	d.Hub.Publish(typ, t.ProjectID, taskData(t))
 	d.Hub.Publish(typ, t.ProjectID, map[string]any{
-		"agent": id, "task": t.TaskID, "progress": t.Progress, "activity": t.CurrentActivity,
+		"task_id": t.TaskID, "project_id": t.ProjectID, "title": t.Title,
+		"status": t.Status, "assigned_to": t.AssignedTo, "progress": t.Progress,
+		"current_activity": t.CurrentActivity, "agent": id,
 	})
 	return fmt.Sprintf("task %s: %d%% — %s", t.TaskID, t.Progress, orDash(t.CurrentActivity))
 }
@@ -561,9 +608,11 @@ func handleCompleteTask(d *Deps, req mcp.CallToolRequest) string {
 	if err != nil {
 		return "error: " + err.Error()
 	}
-	d.Hub.Publish(event.TaskCompleted, t.ProjectID, taskData(t))
 	d.Hub.Publish(event.TaskCompleted, t.ProjectID, map[string]any{
-		"agent": id, "task": t.TaskID,
+		"task_id": t.TaskID, "project_id": t.ProjectID, "title": t.Title,
+		"status": t.Status, "assigned_to": t.AssignedTo, "progress": t.Progress,
+		"current_activity": t.CurrentActivity, "agent": id,
+		"summary": t.CompletionSummary,
 	})
 	if !hasHandoff {
 		return fmt.Sprintf("task %s completed by %s. Other agents in %s have been notified.", taskID, id, t.ProjectID)
@@ -835,21 +884,26 @@ func handleGetMessages(d *Deps, req mcp.CallToolRequest) string {
 		limit = 50
 	}
 	if boolean(args, "unread_only") && agentID != "" {
-		if proj == "" {
-			proj = d.projectOf("", agentID)
-		}
-		a, err := d.Agents.Get(agentID)
-		if err != nil || a == nil {
-			return "error: unknown agent " + agentID
-		}
-		msgs, err := d.Msgs.Unread(agentID, proj, a.LastMsgID, limit)
+		// Unread = unacknowledged inbox events of message types.
+		rows, err := d.Inbox.Unacked(agentID, limit)
 		if err != nil {
 			return "error: " + err.Error()
+		}
+		msgs := []inbox.Event{}
+		for _, e := range rows {
+			if inbox.IsMessageType(e.Type) {
+				msgs = append(msgs, e)
+			}
 		}
 		if len(msgs) == 0 {
 			return fmt.Sprintf("no unread messages for %s", agentID)
 		}
-		return formatMessages(msgs) + fmt.Sprintf("\n%d unread. Call mark_read after reading.", len(msgs))
+		var b strings.Builder
+		for _, e := range msgs {
+			b.WriteString(formatInboxEvent(e))
+			b.WriteString("\n")
+		}
+		return b.String() + fmt.Sprintf("\n%d unread. Acknowledge with mark_read or ack_event after reading.", len(msgs))
 	}
 	msgs, err := d.Msgs.List(proj, agentID, limit)
 	if err != nil {
@@ -883,16 +937,124 @@ func handleMarkRead(d *Deps, req mcp.CallToolRequest) string {
 	if id == "" {
 		return "error: agent_id is required"
 	}
-	msgID := int64(num(args, "message_id"))
-	if msgID == 0 {
-		if max, err := d.Msgs.MaxID(); err == nil {
-			msgID = max
-		}
-	}
-	if err := d.Agents.SetCursor(id, msgID); err != nil {
+	n, err := d.Inbox.AckAll(id)
+	if err != nil {
 		return "error: " + err.Error()
 	}
-	return fmt.Sprintf("%s marked read through message #%d", id, msgID)
+	return fmt.Sprintf("%s marked read: %d inbox event(s) acknowledged", id, n)
+}
+
+// ---- inbox (real-time agent protocol) ----
+
+func handleGetUnread(d *Deps, req mcp.CallToolRequest) string {
+	args := req.GetArguments()
+	id := agentFrom(args, req, "agent_id")
+	if id == "" {
+		return "error: agent_id is required"
+	}
+	rows, err := d.Inbox.Unacked(id, num(args, "limit"))
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	if len(rows) == 0 {
+		return fmt.Sprintf("no unacknowledged events for %s. "+
+			"Use wait_for_events(agent_id=%q) to wait for the next one.", id, id)
+	}
+	var b strings.Builder
+	for _, e := range rows {
+		b.WriteString(formatInboxEvent(e))
+		b.WriteString("\n")
+	}
+	b.WriteString(fmt.Sprintf("\n%d unacknowledged. Acknowledge with ack_event after processing each one "+
+		"(or ack_event without event_id to acknowledge everything).", len(rows)))
+	return b.String()
+}
+
+func handleAckEvent(d *Deps, req mcp.CallToolRequest) string {
+	args := req.GetArguments()
+	id := agentFrom(args, req, "agent_id")
+	if id == "" {
+		return "error: agent_id is required"
+	}
+	eventID := int64(num(args, "event_id"))
+	var (
+		n   int64
+		err error
+	)
+	if eventID > 0 {
+		n, err = d.Inbox.AckThrough(id, eventID)
+	} else {
+		n, err = d.Inbox.AckAll(id)
+	}
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	if eventID > 0 {
+		return fmt.Sprintf("acknowledged %d inbox event(s) for %s through event #%d", n, id, eventID)
+	}
+	return fmt.Sprintf("acknowledged %d inbox event(s) for %s", n, id)
+}
+
+func handleWaitForEvents(ctx context.Context, d *Deps, req mcp.CallToolRequest) string {
+	args := req.GetArguments()
+	id := agentFrom(args, req, "agent_id")
+	if id == "" {
+		return "error: agent_id is required"
+	}
+	timeoutMs := num(args, "timeout_ms")
+	if timeoutMs == 0 {
+		timeoutMs = 30000
+	}
+	if timeoutMs < 1000 {
+		timeoutMs = 1000
+	}
+	if timeoutMs > 60000 {
+		timeoutMs = 60000
+	}
+	rows, err := d.Inbox.Wait(ctx, id, time.Duration(timeoutMs)*time.Millisecond)
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	if len(rows) == 0 {
+		return fmt.Sprintf("timeout: no new events for %s. Call wait_for_events again to keep waiting.", id)
+	}
+	var b strings.Builder
+	for _, e := range rows {
+		b.WriteString(formatInboxEvent(e))
+		b.WriteString("\n")
+	}
+	b.WriteString(fmt.Sprintf("\n%d unacknowledged. Acknowledge with ack_event after processing.", len(rows)))
+	return b.String()
+}
+
+// formatInboxEvent renders one inbox event compactly for LLM consumption.
+func formatInboxEvent(e inbox.Event) string {
+	data := e.Data
+	switch e.Type {
+	case inbox.TypeMessage, inbox.TypeQuestion, inbox.TypeAnswer,
+		inbox.TypeInstruction, inbox.TypeInterfaceChange:
+		to := inbox.DataOf(e, "to_agent")
+		if to == "" {
+			to = "all"
+		}
+		return fmt.Sprintf("#%d %s [%s] %s → %s: %s",
+			e.EventID, e.Type, e.CreatedAt, orDash(inbox.DataOf(e, "from_agent")), to, inbox.DataOf(e, "content"))
+	case inbox.TypeProgress:
+		return fmt.Sprintf("#%d progress [%s] %s: task %s at %v%% — %s",
+			e.EventID, e.CreatedAt, orDash(inbox.DataOf(e, "agent")), orDash(inbox.DataOf(e, "task_id")),
+			data["progress"], orDash(inbox.DataOf(e, "current_activity")))
+	case inbox.TypeDecision:
+		return fmt.Sprintf("#%d decision [%s] %s: %s",
+			e.EventID, e.CreatedAt, orDash(inbox.DataOf(e, "title")), inbox.DataOf(e, "decision"))
+	case inbox.TypeTaskCompleted:
+		return fmt.Sprintf("#%d task_completed [%s] task %s completed by %s",
+			e.EventID, e.CreatedAt, orDash(inbox.DataOf(e, "task_id")), orDash(inbox.DataOf(e, "agent")))
+	case inbox.TypeTaskHandoff:
+		return fmt.Sprintf("#%d task_handoff [%s] task %s by %s: %s",
+			e.EventID, e.CreatedAt, orDash(inbox.DataOf(e, "task")), orDash(inbox.DataOf(e, "agent")),
+			inbox.DataOf(e, "summary"))
+	}
+	return fmt.Sprintf("#%d %s [%s]", e.EventID, e.Type, e.CreatedAt)
 }
 
 // ---- shared state ----
@@ -972,8 +1134,8 @@ func handleBriefing(d *Deps, req mcp.CallToolRequest) string {
 	b.WriteString(recentlyCompleted(d, proj))
 
 	if me != nil {
-		if unread, err := d.Msgs.Unread(id, proj, me.LastMsgID, 100); err == nil && len(unread) > 0 {
-			fmt.Fprintf(&b, "\nYou have %d unread message(s). Use get_messages(unread_only=true, agent_id=%q) to read them.\n", len(unread), id)
+		if n, err := d.Inbox.UnackedCount(id); err == nil && n > 0 {
+			fmt.Fprintf(&b, "\nYou have %d unacknowledged inbox event(s). Use get_unread(agent_id=%q) to read them, then ack_event to acknowledge.\n", n, id)
 		}
 	}
 
@@ -1006,8 +1168,8 @@ func (d *Deps) deltaBriefing(proj, id string, sinceID int64) string {
 		if t, _ := d.Tasks.Get(me.CurrentTask); t != nil {
 			fmt.Fprintf(&b, "Your task: %s (%s, %d%%%s)\n\n", t.TaskID, t.Status, t.Progress, suffix(t.CurrentActivity))
 		}
-		if unread, err := d.Msgs.Unread(id, proj, me.LastMsgID, 100); err == nil && len(unread) > 0 {
-			fmt.Fprintf(&b, "You have %d unread message(s). Use get_messages(unread_only=true, agent_id=%q) to read them.\n\n", len(unread), id)
+		if n, err := d.Inbox.UnackedCount(id); err == nil && n > 0 {
+			fmt.Fprintf(&b, "You have %d unacknowledged inbox event(s). Use get_unread(agent_id=%q) to read them, then ack_event to acknowledge.\n\n", n, id)
 		}
 	}
 

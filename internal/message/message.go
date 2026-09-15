@@ -98,41 +98,6 @@ func (s *Store) Get(id int64) (*Message, error) {
 	return m, err
 }
 
-// Relevant reports whether the message concerns the given agent:
-// it was addressed to them, or broadcast to their project.
-func (m *Message) Relevant(agentID, projectID string) bool {
-	if m.ProjectID != projectID {
-		return false
-	}
-	return m.ToAgent == Broadcast || m.ToAgent == agentID
-}
-
-// Unread returns messages relevant to the agent with id > their delivery
-// cursor, oldest first.
-func (s *Store) Unread(agentID, projectID string, cursor int64, limit int) ([]Message, error) {
-	if limit <= 0 || limit > 500 {
-		limit = 100
-	}
-	query := `SELECT id, project_id, type, from_agent, to_agent, content, reply_to, thread_id, created_at
-	          FROM messages
-	          WHERE project_id = ? AND id > ? AND (to_agent = '' OR to_agent = ?)
-	          ORDER BY id ASC LIMIT ?`
-	rows, err := s.DB.DB.Query(query, projectID, cursor, agentID, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []Message{}
-	for rows.Next() {
-		m, err := scanMessage(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, *m)
-	}
-	return out, rows.Err()
-}
-
 // List returns recent messages for a project (or across all projects),
 // optionally filtered to a specific agent's inbox, oldest first.
 func (s *Store) List(projectID, agentID string, limit int) ([]Message, error) {
@@ -169,15 +134,6 @@ func (s *Store) List(projectID, agentID string, limit int) ([]Message, error) {
 		out[i], out[j] = out[j], out[i]
 	}
 	return out, rows.Err()
-}
-
-// MaxID returns the highest message id (used to fast-forward a cursor).
-func (s *Store) MaxID() (int64, error) {
-	var id sql.NullInt64
-	if err := s.DB.DB.QueryRow(`SELECT MAX(id) FROM messages`).Scan(&id); err != nil {
-		return 0, err
-	}
-	return id.Int64, nil
 }
 
 type rowScanner interface {

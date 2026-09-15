@@ -1,5 +1,6 @@
 // Package websocket implements the real-time event channel: token auth,
-// heartbeats, presence, live event push and offline replay on reconnect.
+// heartbeats, presence, live event push, inbox delivery and offline replay
+// of unacknowledged inbox events on reconnect.
 package websocket
 
 import (
@@ -15,6 +16,7 @@ import (
 	"agentwire/internal/agent"
 	"agentwire/internal/db"
 	"agentwire/internal/event"
+	"agentwire/internal/inbox"
 	"agentwire/internal/message"
 	"agentwire/internal/task"
 )
@@ -37,6 +39,7 @@ type Server struct {
 	Agents *agent.Store
 	Tasks  *task.Store
 	Msgs   *message.Store
+	Inbox  *inbox.Store
 	Token  string // empty = auth disabled
 
 	Upgrader websocket.Upgrader
@@ -47,13 +50,14 @@ type Server struct {
 	byAgent map[string]int64 // agent_id -> active connection id (last wins)
 }
 
-func NewServer(database *db.Store, hub *event.Hub, agents *agent.Store, tasks *task.Store, msgs *message.Store, token string) *Server {
+func NewServer(database *db.Store, hub *event.Hub, agents *agent.Store, tasks *task.Store, msgs *message.Store, inbx *inbox.Store, token string) *Server {
 	return &Server{
 		DB:     database,
 		Hub:    hub,
 		Agents: agents,
 		Tasks:  tasks,
 		Msgs:   msgs,
+		Inbox:  inbx,
 		Token:  token,
 		Upgrader: websocket.Upgrader{
 			ReadBufferSize:  4096,
@@ -69,21 +73,22 @@ func NewServer(database *db.Store, hub *event.Hub, agents *agent.Store, tasks *t
 // ---- wire protocol ----
 
 type serverEnvelope struct {
-	Type       string            `json:"type"`
-	Event      *event.Event      `json:"event,omitempty"`
-	Messages   []message.Message `json:"messages,omitempty"`
-	Events     []event.Event     `json:"events,omitempty"`
-	Agents     []agent.Agent     `json:"agents,omitempty"`
-	Decisions  []db.Decision     `json:"decisions,omitempty"`
-	Error      string            `json:"error,omitempty"`
-	AgentID    string            `json:"agent_id,omitempty"`
-	ProjectID  string            `json:"project_id,omitempty"`
-	ServerTime string            `json:"server_time,omitempty"`
+	Type       string        `json:"type"`
+	Event      *event.Event  `json:"event,omitempty"`
+	Inbox      []inbox.Event `json:"inbox,omitempty"`
+	Events     []event.Event `json:"events,omitempty"`
+	Agents     []agent.Agent `json:"agents,omitempty"`
+	Decisions  []db.Decision `json:"decisions,omitempty"`
+	Error      string        `json:"error,omitempty"`
+	AgentID    string        `json:"agent_id,omitempty"`
+	ProjectID  string        `json:"project_id,omitempty"`
+	ServerTime string        `json:"server_time,omitempty"`
 }
 
 type clientEnvelope struct {
 	Type    string `json:"type"`
 	AgentID string `json:"agent_id,omitempty"`
+	EventID int64  `json:"event_id,omitempty"`
 }
 
 // ServeHTTP upgrades the connection and runs the client session.
@@ -254,11 +259,13 @@ func (c *client) run(events <-chan event.Event) {
 }
 
 // watchEvents receives hub events and pushes the ones relevant to this
-// client. Messages addressed to this agent also advance the offline delivery
-// cursor, since delivery over the socket counts as delivered.
+// client. Delivery over the socket is real-time only: it never acknowledges
+// anything. The agent's runtime acks inbox events explicitly (via the
+// {"type":"ack","event_id":…} message or the MCP ack_event tool) once the
+// LLM has actually consumed them; unacked events are re-delivered on
+// reconnect.
 func (c *client) watchEvents(events <-chan event.Event, done <-chan struct{}, wg *sync.WaitGroup) {
 	defer wg.Done()
-	s := c.server
 	for {
 		select {
 		case <-done:
@@ -271,53 +278,19 @@ func (c *client) watchEvents(events <-chan event.Event, done <-chan struct{}, wg
 				continue // not for my project (anonymous listeners get everything)
 			}
 			c.push(serverEnvelope{Type: "event", Event: &ev})
-
-			if c.agentID != "" && ev.Type == event.MessageCreated {
-				if id, toAgent, proj, ok := messageData(ev.Data); ok &&
-					proj == c.projectID && (toAgent == "" || toAgent == c.agentID) {
-					if err := s.Agents.AdvanceCursor(c.agentID, id); err != nil {
-						slog.Error("cursor advance failed", "agent_id", c.agentID, "err", err)
-					}
-				}
-			}
 		}
 	}
 }
 
-// messageData extracts (id, to_agent, project_id) from a message.created
-// event payload. In-process events carry int64 ids; replayed events (JSON
-// round-tripped through SQLite) carry float64.
-func messageData(data map[string]any) (int64, string, string, bool) {
-	to, _ := data["to_agent"].(string)
-	proj, _ := data["project_id"].(string)
-	switch v := data["id"].(type) {
-	case int64:
-		return v, to, proj, true
-	case float64:
-		return int64(v), to, proj, true
-	case int:
-		return int64(v), to, proj, true
-	}
-	return 0, to, proj, false
-}
-
-// sendReplay delivers everything the agent missed while offline.
+// sendReplay delivers everything the agent missed while offline: every
+// unacknowledged inbox event (the durable inbox — nothing is lost until the
+// agent acks), recent project events, the agent roster and recent decisions.
 func (c *client) sendReplay() {
 	s := c.server
 	env := serverEnvelope{Type: "replay", AgentID: c.agentID, ProjectID: c.projectID}
 
-	a, err := s.Agents.Get(c.agentID)
-	if err != nil || a == nil {
-		return
-	}
-
-	if msgs, err := s.Msgs.Unread(c.agentID, c.projectID, a.LastMsgID, replayLimit); err == nil && len(msgs) > 0 {
-		env.Messages = msgs
-		if last := msgs[len(msgs)-1].ID; last > a.LastMsgID {
-			if err := s.Agents.AdvanceCursor(c.agentID, last); err != nil {
-				slog.Error("cursor advance failed", "agent_id", c.agentID, "err", err)
-			}
-		}
+	if items, err := s.Inbox.Unacked(c.agentID, replayLimit); err == nil && len(items) > 0 {
+		env.Inbox = items
 	}
 	if evs, err := s.Hub.Recent(c.projectID, eventsLimit); err == nil {
 		env.Events = evs
@@ -331,10 +304,10 @@ func (c *client) sendReplay() {
 
 	// Announce the connection to the client itself.
 	c.push(serverEnvelope{Type: "hello", AgentID: c.agentID, ProjectID: c.projectID, ServerTime: db.Now()})
-	if len(env.Messages) > 0 || len(env.Events) > 0 {
+	if len(env.Inbox) > 0 || len(env.Events) > 0 || len(env.Agents) > 0 || len(env.Decisions) > 0 {
 		c.push(env)
 		slog.Info("replayed offline state", "agent_id", c.agentID,
-			"messages", len(env.Messages), "events", len(env.Events))
+			"inbox", len(env.Inbox), "events", len(env.Events))
 	}
 }
 
@@ -382,6 +355,19 @@ func (c *client) readPump() {
 		switch msg.Type {
 		case "ping":
 			c.push(serverEnvelope{Type: "pong", ServerTime: db.Now()})
+		case "ack":
+			// Acknowledge inbox events: everything up to event_id (or
+			// everything when omitted). Acked events are never replayed.
+			if c.agentID == "" {
+				continue
+			}
+			if msg.EventID > 0 {
+				if _, err := c.server.Inbox.AckThrough(c.agentID, msg.EventID); err != nil {
+					slog.Error("ws ack failed", "agent_id", c.agentID, "err", err)
+				}
+			} else if _, err := c.server.Inbox.AckAll(c.agentID); err != nil {
+				slog.Error("ws ack failed", "agent_id", c.agentID, "err", err)
+			}
 		}
 	}
 }

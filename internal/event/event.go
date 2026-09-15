@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"agentwire/internal/db"
+	"agentwire/internal/inbox"
 )
 
 // Event type names.
@@ -37,6 +38,20 @@ const (
 	WarningFileOverlap = "warning.file_overlap"
 )
 
+// inboxTypes maps hub event types to the semantic inbox event types. Only
+// these event types land in agent inboxes (see internal/inbox).
+var inboxTypes = map[string]string{
+	MessageCreated:      inbox.TypeMessage,
+	QuestionCreated:     inbox.TypeQuestion,
+	AnswerCreated:       inbox.TypeAnswer,
+	InstructionCreated:  inbox.TypeInstruction,
+	InterfaceChangeSent: inbox.TypeInterfaceChange,
+	TaskProgress:        inbox.TypeProgress,
+	TaskCompleted:       inbox.TypeTaskCompleted,
+	TaskHandoff:         inbox.TypeTaskHandoff,
+	DecisionCreated:     inbox.TypeDecision,
+}
+
 // Event is broadcast to subscribers and persisted in the events table.
 type Event struct {
 	ID        int64          `json:"id"`
@@ -50,8 +65,13 @@ type Event struct {
 // Publish persists first, then broadcasts. Subscribers receive all events for
 // their project; delivery is best-effort (dropped on a slow consumer, who can
 // replay from SQLite via Recent).
+//
+// When an Inbox store is set, Publish also delivers inbox-relevant events
+// into the inbox of every agent they concern (durable, ack-based delivery —
+// see internal/inbox). The inbox store is optional (nil = no inbox delivery).
 type Hub struct {
-	DB *db.Store
+	DB    *db.Store
+	Inbox *inbox.Store
 
 	mu   sync.RWMutex
 	subs map[int64]chan Event
@@ -61,6 +81,9 @@ type Hub struct {
 func NewHub(database *db.Store) *Hub {
 	return &Hub{DB: database, subs: map[int64]chan Event{}}
 }
+
+// SetInbox enables inbox delivery for inbox-relevant events.
+func (h *Hub) SetInbox(store *inbox.Store) { h.Inbox = store }
 
 // Subscribe registers a buffered channel and returns an unsubscribe func.
 func (h *Hub) Subscribe() (<-chan Event, func()) {
@@ -105,6 +128,13 @@ func (h *Hub) Publish(typ, projectID string, data map[string]any) Event {
 		CreatedAt: row.CreatedAt,
 	}
 
+	// Inbox delivery happens before fan-out: when a subscriber receives the
+	// event, its inbox row already exists and wait_for_events callers are
+	// already being woken.
+	if semantic, ok := inboxTypes[typ]; ok && h.Inbox != nil {
+		h.deliverToInbox(semantic, projectID, row.ID, raw, data)
+	}
+
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	for _, ch := range h.subs {
@@ -115,6 +145,50 @@ func (h *Hub) Publish(typ, projectID string, data map[string]any) Event {
 		}
 	}
 	return ev
+}
+
+// deliverToInbox inserts one inbox row per agent the event concerns.
+func (h *Hub) deliverToInbox(typ, projectID string, eventID int64, raw string, data map[string]any) {
+	recipients, err := h.inboxRecipients(typ, projectID, data)
+	if err != nil {
+		slog.Error("inbox recipient resolution failed", "type", typ, "err", err)
+		return
+	}
+	if len(recipients) == 0 {
+		return
+	}
+	if err := h.Inbox.Add(eventID, typ, projectID, raw, recipients); err != nil {
+		slog.Error("inbox insert failed", "type", typ, "err", err)
+	}
+}
+
+// inboxRecipients computes which agents get an inbox row. Message-type
+// events go to the addressed agent (a broadcast goes to everyone in the
+// project). Progress, task and decision events go to everyone in the project
+// except the originator, who produced the event and already knows it.
+func (h *Hub) inboxRecipients(typ, projectID string, data map[string]any) ([]string, error) {
+	if inbox.IsMessageType(typ) {
+		if to, _ := data["to_agent"].(string); to != "" {
+			return []string{to}, nil
+		}
+		return h.Inbox.ListAgents(projectID)
+	}
+	originator, _ := data["agent"].(string)
+	if originator == "" {
+		originator, _ = data["assigned_to"].(string)
+	}
+	agents, err := h.Inbox.ListAgents(projectID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(agents))
+	for _, a := range agents {
+		if a == originator {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out, nil
 }
 
 // Recent returns the last events for a project (or all projects when

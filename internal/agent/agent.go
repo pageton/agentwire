@@ -24,7 +24,6 @@ type Agent struct {
 	ProjectID   string   `json:"project_id,omitempty"`
 	CurrentTask string   `json:"current_task,omitempty"`
 	Files       []string `json:"files,omitempty"`
-	LastMsgID   int64    `json:"-"` // offline delivery cursor
 	LastSeen    string   `json:"last_seen"`
 	CreatedAt   string   `json:"created_at"`
 }
@@ -36,8 +35,8 @@ type Store struct {
 
 func NewStore(database *db.Store) *Store { return &Store{DB: database} }
 
-// Register upserts an agent identity. Presence and delivery cursor are
-// preserved across re-registrations.
+// Register upserts an agent identity. Presence is preserved across
+// re-registrations (the identity survives reconnects).
 func (s *Store) Register(a Agent) error {
 	if a.Type == "" {
 		a.Type = "coding"
@@ -61,7 +60,7 @@ func (s *Store) Register(a Agent) error {
 // Get returns the agent or nil when unknown.
 func (s *Store) Get(agentID string) (*Agent, error) {
 	row := s.DB.DB.QueryRow(
-		`SELECT agent_id, name, type, status, project_id, current_task, files, last_msg_id, last_seen, created_at
+		`SELECT agent_id, name, type, status, project_id, current_task, files, last_seen, created_at
 		 FROM agents WHERE agent_id = ?`,
 		agentID,
 	)
@@ -74,7 +73,7 @@ func (s *Store) Get(agentID string) (*Agent, error) {
 
 // List returns all agents, optionally filtered by project.
 func (s *Store) List(projectID string) ([]Agent, error) {
-	query := `SELECT agent_id, name, type, status, project_id, current_task, files, last_msg_id, last_seen, created_at
+	query := `SELECT agent_id, name, type, status, project_id, current_task, files, last_seen, created_at
 	          FROM agents`
 	var args []any
 	if projectID != "" {
@@ -129,25 +128,6 @@ func (s *Store) SetFiles(agentID string, files []string) error {
 	return err
 }
 
-// AdvanceCursor moves the agent's offline delivery cursor forward to at
-// least msgID. Messages with id > cursor are candidates for offline replay.
-func (s *Store) AdvanceCursor(agentID string, msgID int64) error {
-	_, err := s.DB.DB.Exec(
-		`UPDATE agents SET last_msg_id = MAX(last_msg_id, ?) WHERE agent_id = ?`,
-		msgID, agentID,
-	)
-	return err
-}
-
-// SetCursor sets the delivery cursor explicitly (mark_read).
-func (s *Store) SetCursor(agentID string, msgID int64) error {
-	_, err := s.DB.DB.Exec(
-		`UPDATE agents SET last_msg_id = ? WHERE agent_id = ?`,
-		msgID, agentID,
-	)
-	return err
-}
-
 type rowScanner interface {
 	Scan(dest ...any) error
 }
@@ -155,7 +135,7 @@ type rowScanner interface {
 func scanAgent(row rowScanner) (*Agent, error) {
 	var a Agent
 	var files string
-	err := row.Scan(&a.AgentID, &a.Name, &a.Type, &a.Status, &a.ProjectID, &a.CurrentTask, &files, &a.LastMsgID, &a.LastSeen, &a.CreatedAt)
+	err := row.Scan(&a.AgentID, &a.Name, &a.Type, &a.Status, &a.ProjectID, &a.CurrentTask, &files, &a.LastSeen, &a.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
