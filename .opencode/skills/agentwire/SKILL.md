@@ -1,6 +1,6 @@
 ---
 name: agentwire
-description: Use when connected to an AgentWire MCP server (tools like register_agent, get_briefing, claim_task, update_progress, ask_agent, record_decision) or when working on a project with multiple AI agents coordinating in parallel. Covers the session-start protocol, progress reporting, file-overlap warnings, messaging etiquette, shared decisions/context, and task completion.
+description: Use when connected to an AgentWire MCP server (tools like register_agent, get_briefing, claim_task, update_progress, ask_agent, record_decision) or when working on a project with multiple AI agents coordinating in parallel. Covers the session-start protocol, delta briefings, progress reporting, file-overlap warnings, messaging etiquette, shared decisions/context, task notes, and structured handoffs on completion.
 ---
 
 # AgentWire coordination protocol
@@ -18,13 +18,17 @@ in messages, don't gate on them.
    identity. Use the same stable `agent_id` every session (e.g. the one
    you were told, otherwise pick `agent-N`). Never create a second id.
 2. `get_briefing(project_id, agent_id)` — your task, other active agents
-   with progress, recent messages, unread messages, recent decisions,
-   file-overlap warnings.
-3. `get_context(project_id)` — read shared project context.
+   with progress, recent messages, unread messages, active decisions,
+   recently completed tasks with handoffs, file-overlap warnings. The
+   briefing ends with `Latest event id: N` — remember it; pass it as
+   `since_event_id` next session to get only what changed since.
+3. `list_context(project_id)` or `list_context(project_id, prefix="api/")` —
+   discover shared context without knowing exact keys.
 4. `list_tasks(project_id)` then `claim_task(task_id, agent_id)` — start
    immediately. Claiming never waits, even if related tasks are pending.
-5. `get_messages(agent_id, unread_only=true)` → `mark_read(agent_id)` —
-   clear your inbox.
+5. If the task (or a related completed one) has prior work:
+   `get_task(task_id)` — description, handoff, completion summary, notes,
+   and the values of any context keys the handoff references.
 
 ## While working
 
@@ -32,6 +36,10 @@ in messages, don't gate on them.
   `update_progress(task_id, progress, activity, agent_id)`. Keep
   `activity` human-readable and specific ("Implemented the wakeup
   decision table", not "working").
+- **Record durable facts on the task as you learn them**:
+  `add_task_note(task_id, note, agent_id)` — interface facts, gotchas,
+  blockers. Notes are append-only and survive message history; the next
+  claimant reads the task, not 40 messages.
 - **Report files you're touching** whenever the set changes:
   `set_files(agent_id, files)` — pass the FULL list each time (it
   replaces the previous one).
@@ -39,12 +47,18 @@ in messages, don't gate on them.
   `get_file_overlaps(project_id)`. Warnings are visibility only —
   negotiate with the other agent via `ask_agent` if you both need the
   same file.
-- **Before asking a question**, check `get_decisions(project_id)` and
-  `get_context(project_id)` — another agent may already have answered.
+- **Before asking a question**, check `list_context(project_id, search=...)`
+  and `get_decisions(project_id, active_only=true)` — another agent may
+  already have answered. Knowledge you can't find doesn't exist; search
+  before you ask.
 - **After every important decision you make** (API shape, naming,
   behavior that affects others): `record_decision(project_id, title,
-  decision, reason, agent_id)`. This is how the team avoids re-asking
-  each other the same question.
+  decision, reason, agent_id)`. If a decision replaces an older one,
+  pass `supersedes=<decision id>` — briefings then show only the
+  decision currently in force.
+- **Store reusable facts** with `set_context(project_id, key, value)` and
+  a namespaced key (e.g. `api/recoverer.clock`) so others can find them
+  via `list_context`.
 
 ## Coordinating with other agents
 
@@ -57,7 +71,8 @@ in messages, don't gate on them.
   - Omit `to_agents` to broadcast to the whole project.
   - `to_agents: "agent-1,agent-2"` sends to several.
 - When you publish a public interface or change one, send an
-  `interface_change` broadcast so downstream agents adapt.
+  `interface_change` broadcast so downstream agents adapt, and add a
+  task note recording the interface.
 - Inbox (MCP-only agents, no WebSocket): poll
   `get_messages(unread_only=true, agent_id=...)` and dismiss with
   `mark_read`.
@@ -67,22 +82,44 @@ in messages, don't gate on them.
 - `update_progress(task_id, progress, activity, agent_id,
   status="blocked")` so the team sees you're waiting.
 - Broadcast a `blocked` message naming what you need and from whom.
+- Add a task note describing exactly what unblocks you.
 - Keep working on anything else you own — never idle-wait.
 
-## Finishing
+## Finishing — leave a handoff
 
-- `complete_task(task_id, agent_id)`.
-- Broadcast a `completed` message summarizing what you delivered and
-  what interface you expose, so agents conceptually depending on you can
-  wire against it.
-- `set_files(agent_id, files=[])` to clear your file list.
+When completing a task, don't just mark it done. Give the next agent
+everything they need in one call:
+
+```
+complete_task(task_id, agent_id,
+  summary="what was accomplished",          # required for a handoff
+  changed_files=["src/td/expiry.rs", ...],
+  details=["important implementation details", ...],
+  decisions_made=["decisions taken during the work", ...],
+  next_steps=["remaining work / what to do next", ...],
+  context_keys=["api/clock", ...])          # keys stored via set_context
+```
+
+- The handoff is stored on the task and broadcast live
+  (`task.handoff` event); offline agents get it in their briefing
+  ("Recently completed") or via `get_task(task_id)`.
+- Durable decisions should ALSO be recorded via `record_decision` —
+  `decisions_made` in the handoff is a convenience summary.
+- Handoffs are informational: they never block or trigger other tasks.
+- After completing: `set_files(agent_id, files=[])` to clear your list.
+- Before starting a task someone else completed, read
+  `get_task(task_id)` instead of asking what happened.
 
 ## Shared memory
 
 - `set_context(project_id, key, value)` / `get_context(project_id)`
   (optionally with `key`) — shared key/value project memory. Use for
   facts everyone needs (build commands, known gotchas).
-- `record_decision` / `get_decisions` — durable decisions with reasons.
+- `list_context(project_id, prefix=..., search=..., limit=...)` —
+  discover context by key prefix and/or key/value substring. Always
+  search here before asking a teammate.
+- `record_decision` / `get_decisions` — durable decisions with reasons;
+  supersede outdated ones instead of recording contradictions.
 
 ## Tool reference
 
@@ -94,15 +131,18 @@ in messages, don't gate on them.
 | `list_tasks` / `create_task` | task state |
 | `claim_task` | start a task (never blocks) |
 | `update_progress` | progress % + activity, pushed to the team |
-| `complete_task` | mark done (100%) |
+| `complete_task` | mark done (100%); optionally record a structured handoff |
+| `get_task` | task details: handoff, completion summary, notes, context values |
+| `add_task_note` / `get_task_notes` | durable per-task knowledge |
 | `send_message` | direct (1 or many) or broadcast, 10 message types |
 | `ask_agent` | question with thread |
 | `reply_message` | answer, inherits thread |
 | `get_messages` / `mark_read` | inbox + offline delivery |
 | `get_project_activity` | full live picture of the project |
-| `get_briefing` | startup briefing for a (re)starting agent |
-| `record_decision` / `get_decisions` | shared decisions |
+| `get_briefing` | startup briefing; `since_event_id` for a delta briefing |
+| `record_decision` / `get_decisions` | shared decisions; supersession supported |
 | `set_context` / `get_context` | shared key/value context |
+| `list_context` | discover context by key prefix / key or value substring |
 
 ## Etiquette
 
@@ -110,5 +150,8 @@ in messages, don't gate on them.
 - Progress is cheap; silence is expensive. Update at every checkpoint.
 - Prefer `reply_message` over `send_message` when answering.
 - Record decisions once — teammates read them instead of re-asking.
+- Search (`list_context`, `get_decisions`, `get_task`) before you ask.
+- Leave a handoff on completion — it is the difference between the next
+  agent starting informed or re-reading the whole history.
 - If you and another agent overlap on a file, negotiate explicitly with
   a message; AgentWire will not stop either of you.
