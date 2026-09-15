@@ -93,10 +93,11 @@ Point the MCP client at the server (streamable HTTP):
   ```json
   { "mcpServers": { "agentwire": {
       "type": "http",
-      "url": "http://localhost:8080/mcp",
-      "headers": { "Authorization": "Bearer secret123" }
+      "url": "http://localhost:8080/mcp"
   } } }
   ```
+  No `headers` needed when `AGENTWIRE_TOKEN` is unset (the default). With a
+  token, add `"headers": { "Authorization": "Bearer <token>" }`.
 - OpenCode:
   ```json
   { "mcp": { "agentwire": {
